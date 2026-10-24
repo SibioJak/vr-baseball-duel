@@ -149,16 +149,19 @@ func _init() -> void:
 	check(fb_cross.y > 0.2 and fb_cross.y < 1.8, "fastball crosses in a sane zone band (y=%.2f)" % fb_cross.y)
 
 	var slow_speed: float = 34.0
+	# A 76 mph pitch thrown flat bounces before the plate (checked: it does);
+	# both slow pitches get the slight upward arc a real pitcher aims with.
 	var fb_slow: Dictionary = ThrowFeatures.simulate_flight(
 		Vector3(0.18, 1.72, -0.30),
-		Vector3(0.0, -0.015, -1.0).normalized() * slow_speed,
+		Vector3(0.0, 0.03, -1.0).normalized() * slow_speed,
 		fb_axis, float(fb_spin["rate"]))
 	var cb_spin: Dictionary = ThrowFeatures.spin_params("CB", 0.8)
 	var cb_axis: Vector3 = cb_spin["axis"]
 	var cb_flight: Dictionary = ThrowFeatures.simulate_flight(
 		Vector3(0.18, 1.72, -0.30),
-		Vector3(0.0, -0.015, -1.0).normalized() * slow_speed,
+		Vector3(0.0, 0.03, -1.0).normalized() * slow_speed,
 		cb_axis, float(cb_spin["rate"]))
+	check(bool(fb_slow["crossed"]) and bool(cb_flight["crossed"]), "both same-speed comparison pitches reach the plate")
 	var fb_slow_cross: Vector3 = fb_slow["cross_pos"]
 	var cb_cross: Vector3 = cb_flight["cross_pos"]
 	check(cb_cross.y < fb_slow_cross.y - 0.25,
