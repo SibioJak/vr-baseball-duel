@@ -1,0 +1,17 @@
+# Godot 4
+.godot/
+*.uid
+/android/
+
+# Build/export output
+/build/
+/exports/
+*.pck
+*.exe
+*.x86_64
+*.apk
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
