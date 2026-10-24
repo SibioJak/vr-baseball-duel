@@ -14,8 +14,8 @@ const PLATE_POS: Vector3 = Vector3(0.0, 0.0, -18.44) # 60.5 ft from the mound
 const ZONE_HALF_W: float = 0.216 # 17 in wide zone
 const BALL_R: float = 0.037
 
-const PANEL_PX: Vector2i = Vector2i(1024, 760)
-const PANEL_M: Vector2 = Vector2(1.20, 0.89)
+const PANEL_PX: Vector2i = Vector2i(1024, 880)
+const PANEL_M: Vector2 = Vector2(1.20, 1.03)
 const BOARD_PX: Vector2i = Vector2i(1024, 512)
 const BOARD_M: Vector2 = Vector2(3.3, 1.65)
 
@@ -52,8 +52,7 @@ var rng := RandomNumberGenerator.new()
 # ---------------------------------------------------------------- nodes
 var origin: XROrigin3D
 var cam: XRCamera3D
-var grip_ctrl: Dictionary = {} # "L"/"R" -> XRController3D (grip pose)
-var aim_ctrl: Dictionary = {}
+var hand_ctrl: Dictionary = {} # "L"/"R" -> the ONE XRController3D per hand (PVLDS shape)
 var ball_in_hand_mesh: MeshInstance3D
 var zone_frame: Node3D
 var zone_bottom: float = 0.48
@@ -265,26 +264,30 @@ func _build_rig() -> void:
 		fallback.look_at(Vector3(0.0, 1.0, PLATE_POS.z), Vector3.UP)
 		fallback.current = true
 	for hand: String in ["L", "R"]:
-		# Tracker names are the OpenXR user paths - this is exactly what
-		# PVLDS (Chris's working launcher, same PC/Quest/VD) uses. The
-		# shipped build used "left_hand"/"right_hand": no such trackers
-		# exist in the real runtime, so on hardware the controllers never
-		# got a pose, get_is_active() stayed false, and the reps/beam/ball
-		# all stayed hidden - while the render test fed fake trackers
-		# under those same wrong names and reported everything alive.
+		# PVLDS shape, copied exactly (third fix pass). PVLDS - Chris's
+		# working launcher on this same PC/Quest/VD - creates ONE
+		# XRController3D per hand, sets ONLY .tracker to the OpenXR user
+		# path, and never touches .pose (it stays the class default,
+		# "default"). This rig's history: pass 1 shipped tracker names
+		# "left_hand"/"right_hand", which no runtime registers. Pass 2
+		# fixed the names but kept TWO nodes per hand with explicit
+		# grip_pose/aim_pose - and the field DEBUG block then showed
+		# XRServer.get_tracker("/user/hand/...") returning NULL in this
+		# app while the HMD tracked fine: the runtime never registered
+		# hand trackers at all under the two-node pose-split shape, so
+		# every controller stayed inactive at the origin. So now: one
+		# node per hand, default pose, everything (rep, pointer, held
+		# ball, throw sampling) derived from that single node - and
+		# where a caller genuinely needs the aim/grip distinction it
+		# reads tracker.get_pose() off the XRPositionalTracker instead
+		# of spawning a second node.
 		var tracker_name: StringName = &"/user/hand/left" if hand == "L" else &"/user/hand/right"
-		var g := XRController3D.new()
-		g.tracker = tracker_name
-		g.pose = &"grip_pose"
-		origin.add_child(g)
-		grip_ctrl[hand] = g
-		var a := XRController3D.new()
-		a.tracker = tracker_name
-		a.pose = &"aim_pose"
-		origin.add_child(a)
-		aim_ctrl[hand] = a
-		_build_controller_rep(g, hand)
-		_build_pointer(a, hand)
+		var c := XRController3D.new()
+		c.tracker = tracker_name
+		origin.add_child(c)
+		hand_ctrl[hand] = c
+		_build_controller_rep(c, hand)
+		_build_pointer(c, hand)
 	# The ball you hold in your throwing hand - visible from the first frame,
 	# so the player's first sight in the scene is "I am holding a ball."
 	var ball_mesh := SphereMesh.new()
@@ -346,11 +349,12 @@ func _build_controller_rep(ctrl: XRController3D, hand: String) -> void:
 	rep.add_child(tag)
 
 
-# The pointer lives on BOTH aim controllers from the start (the old build
+# The pointer lives on BOTH hand controllers from the start (the old build
 # grew the ray lazily onto whichever hand was off-hand at first use, and a
 # RayCast3D renders nothing - so the player saw no ray at all). The beam is
 # a thin box stretched along the ray; the marker parks at the hit point.
-func _build_pointer(aim: XRController3D, hand: String) -> void:
+# Aim = the controller node's own forward (-Z), exactly how PVLDS aims.
+func _build_pointer(ctrl: XRController3D, hand: String) -> void:
 	var ray := RayCast3D.new()
 	ray.name = "PointerRay" + hand
 	ray.target_position = Vector3(0.0, 0.0, -4.0)
@@ -360,7 +364,7 @@ func _build_pointer(aim: XRController3D, hand: String) -> void:
 	# ever have registered even with a visible panel.
 	ray.collide_with_areas = true
 	ray.enabled = true
-	aim.add_child(ray)
+	ctrl.add_child(ray)
 	pointer_ray_by_hand[hand] = ray
 	var beam := MeshInstance3D.new()
 	var beam_mesh := BoxMesh.new()
@@ -374,7 +378,7 @@ func _build_pointer(aim: XRController3D, hand: String) -> void:
 	beam.position = Vector3(0.0, 0.0, -2.0)
 	beam.scale = Vector3(1.0, 1.0, 4.0)
 	beam.visible = false
-	aim.add_child(beam)
+	ctrl.add_child(beam)
 	pointer_beam[hand] = beam
 	pointer_beam_mat[hand] = bmat
 	var hitm := MeshInstance3D.new()
@@ -387,18 +391,12 @@ func _build_pointer(aim: XRController3D, hand: String) -> void:
 	hmat.albedo_color = Color(1.0, 0.9, 0.3)
 	hitm.material_override = hmat
 	hitm.visible = false
-	aim.add_child(hitm)
+	ctrl.add_child(hitm)
 	pointer_hit[hand] = hitm
 
 
 func _throw_hand_node() -> XRController3D:
-	var c: XRController3D = grip_ctrl[throwing_hand]
-	return c
-
-
-func _off_hand_node() -> XRController3D:
-	var other: String = "L" if throwing_hand == "R" else "R"
-	var c: XRController3D = aim_ctrl[other]
+	var c: XRController3D = hand_ctrl[throwing_hand]
 	return c
 
 
@@ -858,8 +856,8 @@ func _physics_process(delta: float) -> void:
 	# Controller representations show whenever their controller is tracked.
 	for h: String in ["L", "R"]:
 		var rep: Node3D = ctrl_rep[h]
-		var gc: XRController3D = grip_ctrl[h]
-		rep.visible = gc.get_is_active()
+		var hc: XRController3D = hand_ctrl[h]
+		rep.visible = hc.get_is_active()
 	if mode == Mode.WATCH:
 		holding = false
 		ball_in_hand_mesh.visible = false
@@ -1405,38 +1403,91 @@ func _off_hand() -> String:
 	return "L" if throwing_hand == "R" else "R"
 
 
-# DEBUG (temporary): one line per hand tracing the whole input chain -
-# XRServer tracker registered -> pose has tracking data -> controller
-# active -> live position and analog values. If controllers ever go
-# missing again, this block on a screenshot names the dead link.
+# DEBUG v2 (temporary): enumerate, don't assume. One line per hand for
+# the duel's own chain, then a full census of EVERY tracker XRServer
+# knows - key, type, which known poses carry live data. The second
+# headset run showed NO-TRACKER for both hands in an app whose runtime
+# demonstrably had the same hardware working in PVLDS; if hands are
+# ever missing again, this census shows what the runtime DID register
+# (head only? hands under unexpected names?) and ends name-guessing.
+func _hand_tracker_name(hand: String) -> StringName:
+	return &"/user/hand/left" if hand == "L" else &"/user/hand/right"
+
+
+# XRPositionalTracker cannot enumerate its own poses, so probe the
+# pose names this project (and the class defaults) actually use.
+func _live_pose_names(t: XRPositionalTracker) -> PackedStringArray:
+	var live := PackedStringArray()
+	for pose_name: StringName in [&"default", &"default_pose", &"grip_pose", &"aim_pose", &"palm_pose"]:
+		var pose: XRPose = t.get_pose(pose_name)
+		if pose != null and pose.has_tracking_data:
+			live.append(String(pose_name))
+	return live
+
+
+func _tracker_type_text(t: XRPositionalTracker) -> String:
+	match t.get_tracker_type():
+		XRServer.TRACKER_HEAD:
+			return "HEAD"
+		XRServer.TRACKER_CONTROLLER:
+			return "CONTROLLER"
+		XRServer.TRACKER_BASESTATION:
+			return "BASESTATION"
+		XRServer.TRACKER_ANCHOR:
+			return "ANCHOR"
+	return "UNKNOWN(%d)" % t.get_tracker_type()
+
+
+func _session_state_text() -> String:
+	var iface: XRInterface = XRServer.find_interface("OpenXR")
+	if iface == null:
+		return "no-interface"
+	if not iface.has_method("get_session_state"):
+		return "n/a"
+	var names: Array = ["UNKNOWN", "IDLE", "READY", "SYNCHRONIZED", "VISIBLE", "FOCUSED", "STOPPING", "LOSS_PENDING", "EXITING"]
+	var idx: int = int(iface.get_session_state())
+	if idx >= 0 and idx < names.size():
+		return String(names[idx])
+	return str(idx)
+
+
 func _debug_hand_line(hand: String) -> String:
-	var tname: StringName = &"/user/hand/left" if hand == "L" else &"/user/hand/right"
-	var grip_c: XRController3D = grip_ctrl[hand]
-	var aim_c: XRController3D = aim_ctrl[hand]
+	var tname: StringName = _hand_tracker_name(hand)
+	var ctrl: XRController3D = hand_ctrl[hand]
 	var tracker: XRPositionalTracker = XRServer.get_tracker(tname)
 	var found: String = "FOUND" if tracker != null else "MISSING"
-	var pose_state: String = "NO-TRACKER"
-	if tracker != null:
-		var pose: XRPose = tracker.get_pose(&"grip_pose")
-		pose_state = "POSE-OK" if pose != null and pose.has_tracking_data else "NO-POSE"
-	var pos: Vector3 = grip_c.global_position
-	return "%s: tracker %s %s | active G:%s A:%s | pos (%.2f, %.2f, %.2f) | grip %.2f trig %.2f" % [
-		hand, found, pose_state,
-		str(grip_c.get_is_active()), str(aim_c.get_is_active()),
+	var live: PackedStringArray = _live_pose_names(tracker) if tracker != null else PackedStringArray()
+	var pos: Vector3 = ctrl.global_position
+	return "%s: tracker %s | poses: %s | active %s | pos (%.2f, %.2f, %.2f) | grip %.2f trig %.2f" % [
+		hand, found, "none" if live.is_empty() else ",".join(live),
+		str(ctrl.get_is_active()),
 		pos.x, pos.y, pos.z,
-		_input_float(grip_c, &"grip"), _input_float(aim_c, &"trigger")]
+		_input_float(ctrl, &"grip"), _input_float(ctrl, &"trigger")]
 
 
 func _update_debug() -> void:
 	if debug_label == null:
 		return
-	debug_label.text = "DEBUG - xr_ok: %s\n%s\n%s" % [
-		str(xr_ok), _debug_hand_line("L"), _debug_hand_line("R")]
+	var lines := PackedStringArray()
+	lines.append("DEBUG - xr_ok: %s | session: %s" % [str(xr_ok), _session_state_text()])
+	lines.append(_debug_hand_line("L"))
+	lines.append(_debug_hand_line("R"))
+	var trackers: Dictionary = XRServer.get_trackers(XRServer.TRACKER_ANY)
+	lines.append("XRServer trackers: %d registered" % trackers.size())
+	for key: Variant in trackers.keys():
+		var t: XRPositionalTracker = trackers[key] as XRPositionalTracker
+		if t == null:
+			lines.append("  %s: (not positional)" % String(key))
+			continue
+		var live: PackedStringArray = _live_pose_names(t)
+		lines.append("  %s [%s] poses: %s" % [
+			String(key), _tracker_type_text(t), "none" if live.is_empty() else ",".join(live)])
+	debug_label.text = "\n".join(lines)
 
 
 func _update_pointer(delta: float) -> void:
 	var off_hand: String = _off_hand()
-	var off_aim: XRController3D = aim_ctrl[off_hand]
+	var off_ctrl: XRController3D = hand_ctrl[off_hand]
 	var ray: RayCast3D = pointer_ray_by_hand[off_hand]
 	var beam: MeshInstance3D = pointer_beam[off_hand]
 	var beam_mat: StandardMaterial3D = pointer_beam_mat[off_hand]
@@ -1448,15 +1499,15 @@ func _update_pointer(delta: float) -> void:
 			var other_hit: MeshInstance3D = pointer_hit[h]
 			other_beam.visible = false
 			other_hit.visible = false
-	var active: bool = off_aim.get_is_active()
+	var active: bool = off_ctrl.get_is_active()
 	var hovering: bool = false
 	var ray_len: float = 4.0
-	var trig: float = _input_float(off_aim, &"trigger")
+	var trig: float = _input_float(off_ctrl, &"trigger")
 	if active and ray.is_colliding() and ray.get_collider() == panel_area:
 		hovering = true
 		var hit: Vector3 = ray.get_collision_point()
-		ray_len = off_aim.global_position.distance_to(hit)
-		hitm.position = off_aim.to_local(hit)
+		ray_len = off_ctrl.global_position.distance_to(hit)
+		hitm.position = off_ctrl.to_local(hit)
 		var local: Vector3 = panel_root.global_transform.affine_inverse() * hit
 		var u: float = clampf(local.x / PANEL_M.x + 0.5, 0.0, 1.0)
 		var v: float = clampf(0.5 - local.y / PANEL_M.y, 0.0, 1.0)
