@@ -21,7 +21,11 @@ func check(cond: bool, name: String) -> void:
 # Synthetic throwing motion at 90 Hz. lv is derived from positions by finite
 # difference, exactly as the live sampler does; av is scripted per pitch:
 # a curveball has a late, x-dominant wrist-roll signature a fastball lacks.
-func make_motion(rng: RandomNumberGenerator, peak_speed: float, is_curve: bool, jitter: float) -> Array:
+# roll_rad >= 0 additionally writes ORIENTATION into the samples: the
+# controller twists about the throw axis by roll_rad across the final
+# 40% of the motion (smoothstep ramp) - the seventh-pass forearm-roll
+# signature. roll_rad < 0 leaves identity orientations (zero roll).
+func make_motion(rng: RandomNumberGenerator, peak_speed: float, is_curve: bool, jitter: float, roll_rad: float = -1.0) -> Array:
 	var samples: Array = []
 	var duration: float = 0.62
 	var steps: int = int(duration * 90.0)
@@ -67,6 +71,18 @@ func make_motion(rng: RandomNumberGenerator, peak_speed: float, is_curve: bool, 
 			var smp: Dictionary = raw
 			var v: Vector3 = smp["lv"]
 			smp["lv"] = v * k
+	if roll_rad >= 0.0:
+		# Twist about the throw axis (the release velocity direction -
+		# the same axis ThrowFeatures.roll_metrics measures against),
+		# composed on a fixed base tilt like a real held controller.
+		var roll_axis: Vector3 = rel_lv.normalized() if cur_speed > 0.01 else Vector3(0.0, 0.0, -1.0)
+		var q_base: Quaternion = Quaternion.from_euler(Vector3(-0.35, 0.15, 0.0))
+		for i3: int in samples.size():
+			var smp2: Dictionary = samples[i3]
+			var s3: float = float(i3) / float(samples.size() - 1)
+			var ramp_u: float = clampf((s3 - 0.6) / 0.4, 0.0, 1.0)
+			var theta: float = roll_rad * ramp_u * ramp_u * (3.0 - 2.0 * ramp_u)
+			smp2["q"] = Quaternion(roll_axis, theta) * q_base
 	return samples
 
 
@@ -103,6 +119,78 @@ func _init() -> void:
 	var rep2: Dictionary = ThrowFeatures.separation_report(mush_templates)
 	var pair2: Dictionary = rep2["FB|CB"]
 	check(not bool(pair2["ok"]), "near-identical templates FAIL separation and must warn (d=%.2f req=%.2f)" % [float(pair2["distance"]), float(pair2["required"])])
+
+	# --- Forearm roll: the twist IS the pitch (seventh pass) -------------
+	# Same generator, SAME speed (7.0), SAME scripted angular velocity -
+	# the ONLY difference between these two arsenals is the wrist twist
+	# written into the samples' orientations (roll_rad 2.4 vs 0.2).
+	var ss_fb: Array = []
+	var ss_cb: Array = []
+	for n3: int in 3:
+		ss_fb.append(ThrowFeatures.extract_features(make_motion(rng, 7.0, false, 0.01, 0.2)))
+		ss_cb.append(ThrowFeatures.extract_features(make_motion(rng, 7.0, false, 0.01, 2.4)))
+	var ss_templates: Dictionary = {
+		"FB": ThrowFeatures.build_template(ss_fb),
+		"CB": ThrowFeatures.build_template(ss_cb),
+	}
+	var twisted: Array = make_motion(rng, 7.0, false, 0.015, 2.4)
+	var rm_twist: Dictionary = ThrowFeatures.roll_metrics(twisted)
+	check(float(rm_twist["total"]) > 1.8, "roll metrics read a real twist (total %.2f rad)" % float(rm_twist["total"]))
+	check(float(rm_twist["peak_rate"]) > 8.0, "roll metrics read the twist rate (peak %.1f rad/s)" % float(rm_twist["peak_rate"]))
+	var plain_m: Array = make_motion(rng, 7.0, false, 0.015, 0.2)
+	var rm_plain: Dictionary = ThrowFeatures.roll_metrics(plain_m)
+	check(absf(float(rm_plain["total"])) < 0.6, "roll metrics read ~no twist on a plain throw (%.2f rad)" % float(rm_plain["total"]))
+	var ct: Dictionary = ThrowFeatures.classify(ThrowFeatures.extract_features(twisted), ss_templates)
+	check(String(ct["pitch"]) == "CB", "same-speed TWISTED throw classifies CB (got %s)" % String(ct["pitch"]))
+	check(float(ct["confidence"]) > 0.5, "twisted CB confidence is solid (%.2f)" % float(ct["confidence"]))
+	var cp: Dictionary = ThrowFeatures.classify(ThrowFeatures.extract_features(plain_m), ss_templates)
+	check(String(cp["pitch"]) == "FB", "same-speed NO-twist throw at CB speed does NOT read CB (got %s)" % String(cp["pitch"]))
+	var rep_ss: Dictionary = ThrowFeatures.separation_report(ss_templates)
+	var pair_ss: Dictionary = rep_ss["FB|CB"]
+	check(bool(pair_ss["ok"]), "roll alone separates same-speed templates (d=%.2f req=%.2f)" % [float(pair_ss["distance"]), float(pair_ss["required"])])
+	check(not bool(pair_ss["roll_gap"]), "twisted pair has a real roll gap (delta %.2f rad)" % float(pair_ss["roll_delta"]))
+	# Two near-plain motions at the same speed: too close, AND the twist
+	# is the missing piece - the report must name it.
+	var mush2_feats: Array = []
+	for n4: int in 3:
+		mush2_feats.append(ThrowFeatures.extract_features(make_motion(rng, 7.0, false, 0.01, 0.35)))
+	var mush2_templates: Dictionary = {"FB": ss_templates["FB"], "CB": ThrowFeatures.build_template(mush2_feats)}
+	var rep_m2: Dictionary = ThrowFeatures.separation_report(mush2_templates)
+	var pair_m2: Dictionary = rep_m2["FB|CB"]
+	check(not bool(pair_m2["ok"]) and bool(pair_m2["roll_gap"]),
+		"no-twist pair fails separation WITH the roll gap named (d=%.2f req=%.2f, roll delta %.2f)" % [float(pair_m2["distance"]), float(pair_m2["required"]), float(pair_m2["roll_delta"])])
+
+	# --- Release intent: the arm, not the button (seventh pass) ----------
+	var clean: Array = make_motion(rng, 8.0, false, 0.0)
+	var peak_dir := Vector3(0.0, 0.0, -1.0)
+	var peak_sp: float = 0.0
+	for raw3: Variant in clean:
+		var cs: Dictionary = raw3
+		var clv: Vector3 = cs["lv"]
+		if clv.length() > peak_sp:
+			peak_sp = clv.length()
+			peak_dir = clv.normalized()
+	var intent_clean: Vector3 = ThrowFeatures.release_intent_dir(clean)
+	check(intent_clean.angle_to(peak_dir) < deg_to_rad(6.0),
+		"intent tracks the peak-speed direction on a clean throw (%.1f deg)" % rad_to_deg(intent_clean.angle_to(peak_dir)))
+	# Button lag: the final recorded frames are follow-through - the hand
+	# has already turned away (45 deg, then 20 deg) and slowed. The old
+	# code flew the ball along the final frame; intent must not.
+	var lagged: Array = make_motion(rng, 8.0, false, 0.0)
+	var n_last: int = lagged.size() - 1
+	var l0: Dictionary = lagged[n_last]
+	var l0_lv: Vector3 = l0["lv"]
+	l0["lv"] = l0_lv.rotated(Vector3.UP, deg_to_rad(45.0)) * 0.70
+	var l1: Dictionary = lagged[n_last - 1]
+	var l1_lv: Vector3 = l1["lv"]
+	l1["lv"] = l1_lv.rotated(Vector3.UP, deg_to_rad(20.0)) * 0.85
+	var intent_lag: Vector3 = ThrowFeatures.release_intent_dir(lagged)
+	check(intent_lag.angle_to(peak_dir) < deg_to_rad(6.0),
+		"intent follows the peak window despite skewed final frames (%.1f deg off peak)" % rad_to_deg(intent_lag.angle_to(peak_dir)))
+	var lag_last: Dictionary = lagged[n_last]
+	var lag_lv: Vector3 = lag_last["lv"]
+	check(intent_lag.angle_to(lag_lv.normalized()) > deg_to_rad(20.0),
+		"intent measurably departs from the skewed button frame (%.1f deg)" % rad_to_deg(intent_lag.angle_to(lag_lv.normalized())))
 
 	# --- Velocity mapping ------------------------------------------------
 	check(absf(ThrowFeatures.map_velocity(8.0, 8.0, 1.0) - 96.0) < 0.01, "calibration max maps to 96 mph")
@@ -166,6 +254,20 @@ func _init() -> void:
 	var cb_cross: Vector3 = cb_flight["cross_pos"]
 	check(cb_cross.y < fb_slow_cross.y - 0.25,
 		"curveball breaks: crosses %.2fm lower than a same-speed fastball (%.2f vs %.2f)" % [fb_slow_cross.y - cb_cross.y, cb_cross.y, fb_slow_cross.y])
+
+	# --- Flight geometry: drop and break must READ (seventh pass) --------
+	# FB: net drop vs the no-gravity straight line from its own release.
+	var fb_start := Vector3(0.18, 1.72, -0.30)
+	var fb_v0: Vector3 = Vector3(0.0, -0.015, -1.0).normalized() * (96.0 / ThrowFeatures.MPH_PER_MPS)
+	var t_line: float = (ThrowFeatures.PLATE_Z - fb_start.z) / fb_v0.z
+	var line_y: float = fb_start.y + fb_v0.y * t_line
+	var fb_drop: float = line_y - fb_cross.y
+	check(fb_drop >= 0.8, "fastball drops %.2f m vs its straight line (>= 0.80)" % fb_drop)
+	# CB: TOTAL break (side + down) vs the same-speed fastball.
+	var break_total: float = Vector2(cb_cross.x - fb_slow_cross.x, cb_cross.y - fb_slow_cross.y).length()
+	check(break_total >= 0.35, "curveball total break is %.2f m vs same-speed fastball (>= 0.35)" % break_total)
+	var cb_rate_rpm: float = float(cb_spin["rate"]) * 60.0 / TAU
+	check(cb_rate_rpm >= 1800.0 and cb_rate_rpm <= 2500.0, "curveball spin is in the real band (%.0f rpm)" % cb_rate_rpm)
 
 	# --- Profile store ------------------------------------------------------
 	var path: String = "user://test_profile.json"

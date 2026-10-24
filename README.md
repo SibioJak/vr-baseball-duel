@@ -34,7 +34,17 @@ that's the failure mode, not the test.
    - 3 fastball motions, 3 curveball motions, an optional third pitch (skippable),
    - 2 FAST fastballs and 2 MEDIUM fastballs (your velocity gears).
    A throw = hold **grip** to hold the ball, make your motion, **release grip**
-   at your release point.
+   at your release point. The ball flies where your *arm* was throwing —
+   direction is read from the peak-speed window of the delivery, not from
+   the frame where the grip happened to let go.
+   - **The curveball step is different now:** before you throw, pick a
+     *picture* — **Turn the doorknob**, **Pull the shade down**, or
+     **Karate chop** — and a translucent ghost arm in front of you demos
+     that motion on a loop. Throw your version of the picture. The game
+     reads the *twist itself* (forearm roll is a first-class classifier
+     feature), so a curveball that's just a slower fastball will be
+     called out by name: the separation warning will tell you the twist
+     isn't reading.
 3. If your fastball and curveball motions read too similar, the panel warns
    you in plain words and offers re-enroll buttons. It never silently accepts
    a mushy pair.
@@ -91,28 +101,53 @@ sound beyond two tiny UI blips (no loops — nothing can play after close).
   0.42–0.96 m), not measured from your body.
 - Magnus/drag constants are tuned so break *reads*; flight time for 96 mph
   measured 0.458 s headlessly vs ~0.43 s real — close, slightly floaty.
+  Ball spin is modeled at true scale (fastball ~1815–2010 rpm, curve
+  ~2050–2435 rpm); measured headlessly, the 96 mph fastball drops 0.81 m
+  against its no-gravity line and the curve breaks 0.36 m off a
+  same-speed fastball.
+- Forearm roll is measured about the throw axis (release velocity
+  direction) from controller orientation — a consistent proxy for the
+  forearm's long axis at release, not a skeletal measurement. Templates
+  and throws are read through the same proxy, so the comparison is fair.
+- Profiles saved before the roll upgrade (format v1) load with their
+  calibration, gears and PBs intact, but their pitch templates are
+  dropped with a panel explanation — v1 measured 12 features, the
+  classifier now reads 15, and old templates would silently misread.
 
 ## Verification (what the machine checked vs what it can't)
 
 Headless, with the real Godot 4.7 binary:
 
-- `tests/run_tests.gd` — 28 checks on the pure logic: classifier separates
+- `tests/run_tests.gd` — 43 checks on the pure logic: classifier separates
   synthetic FB/CB and rejects a mushy pair, velocity mapping/gears, warp
   bounds and delivery compression, flight times, curveball crosses 0.82 m
-  below a same-speed fastball, profile round-trip. All pass.
-- `tests/smoke_main.gd` — 15 checks driving the real main scene: full
+  below a same-speed fastball, profile round-trip. The seventh-pass
+  checks are the decisive ones: two arsenals at *identical* speed and
+  identical scripted angular velocity, differing only in written wrist
+  twist, classify FB vs CB correctly (roll reads 2.39 rad for a 2.4 rad
+  twist; a no-twist throw at curveball speed does *not* read CB); a
+  no-twist pair fails separation with the roll gap named; release intent
+  stays on the peak-speed direction (0.0°) while the skewed final frame
+  sits 38° away; flight geometry asserts fastball drop ≥ 0.80 m (0.81)
+  and curveball total break ≥ 0.35 m (0.36). All pass.
+- `tests/smoke_main.gd` — 31 checks driving the real main scene: full
   enrollment flow, free throw classified and announced ("FASTBALL at 95 mph"),
-  watch-mode curveball announced, profile save/reload/wipe. All pass.
-- `tests/render_spawn_view.gd` — renders an actual frame of the spawn view
-  (Xvfb + GL) with the rig posed as a player stands, and saves it to
-  `tests/spawn_view.png`: panel in front with legible UI text, ball in the
-  throwing hand, both controller representations visible, off-hand beam
-  landing on the panel. It also asserts the pointer ray physically hits
-  the panel's collision area and that a click pushed through the panel
-  viewport really fires a panel button. This test exists because the first
-  headset run found a panel whose UI quad sat *behind* its backing plate
-  (a dark slab, no ball, no visible hands/ray) while every logic check
-  passed.
+  watch-mode curveball announced, profile save/reload/wipe — plus the
+  cue flow (picker + ghost show only on the CB step, the chosen picture
+  is stored with the template and survives a reload) and the v1→v2
+  profile upgrade (templates dropped with an explanation, calibration
+  carried over). All pass.
+- `tests/render_spawn_view.gd` — 44 checks: renders an actual frame of
+  the spawn view (Xvfb + GL) with the rig posed as a player stands, and
+  saves it to `tests/spawn_view.png`: panel in front with legible UI
+  text, ball in the throwing hand, both controller representations
+  visible, off-hand beam landing on the panel. It also asserts the
+  pointer ray physically hits the panel's collision area, that aim and
+  clicks through the production picking path land on the pointed-at
+  button (not a neighbor), and that the cue ghost + picker appear on
+  the CB step. This test exists because the first headset run found a
+  panel whose UI quad sat *behind* its backing plate (a dark slab, no
+  ball, no visible hands/ray) while every logic check passed.
 - Clean `--import` and a brief headless run with zero script errors (OpenXR
   loader errors on this VM are expected — it has no VR runtime).
 

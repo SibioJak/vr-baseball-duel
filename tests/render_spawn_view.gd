@@ -270,6 +270,18 @@ func _run() -> void:
 	await click_via_beam(&"right_hand")
 	check(main.enrolling, "beam click on Begin starts enrollment")
 
+	# --- Seventh pass: the CB cue ghost + picker in the real scene.
+	# The ghost is the teaching surface for Chris's twist call: it must
+	# exist, show only while the curveball step is active, and take the
+	# cue the picker selects.
+	check(main.ghost_root != null, "cue ghost arm exists in the scene")
+	main._start_enrollment(["cb"])
+	await settle()
+	check(main.ghost_root.visible, "ghost arm visible while the CB step is active")
+	check(main.cue_row.visible, "cue picker visible while the CB step is active")
+	main._set_cb_cue("chop")
+	check(main.cb_cue == "chop", "cue picker switches the ghost's picture (karate chop)")
+
 	print("---")
 	if failures == 0:
 		print("SPAWN VIEW: ALL %d CHECKS PASSED" % checks)

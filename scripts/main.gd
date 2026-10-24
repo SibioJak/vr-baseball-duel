@@ -19,6 +19,20 @@ const PANEL_M: Vector2 = Vector2(1.20, 1.03)
 const BOARD_PX: Vector2i = Vector2i(1024, 512)
 const BOARD_M: Vector2 = Vector2(3.3, 1.65)
 
+# Curveball cues (seventh pass, Chris's design call): a player can't be
+# asked to invent "a different motion" in the abstract - they need a
+# PICTURE. These are the three pictures real pitchers learn from. The
+# player picks one before the CB enrollment step; a ghost arm demos it
+# on a loop while the step is active; the choice is stored with the CB
+# template. roll/roll_start/hand_pitch drive the ghost's animation:
+# roll = total forearm twist (rad), roll_start = phase where the twist
+# begins, hand_pitch = extra over-the-top hand tilt (shade only).
+const CB_CUES: Dictionary = {
+	"doorknob": {"label": "Turn the doorknob", "desc": "forearm rotates through release, like opening a door", "roll": 2.0, "roll_start": 0.55, "hand_pitch": 0.0},
+	"shade": {"label": "Pull the shade down", "desc": "hand comes over the top, fingers pull down", "roll": 2.4, "roll_start": 0.45, "hand_pitch": -0.9},
+	"chop": {"label": "Karate chop", "desc": "the edge of your hand leads, wrist rolled hard and late", "roll": 2.6, "roll_start": 0.75, "hand_pitch": 0.0},
+}
+
 enum Mode { SETUP, FREE_THROW, WATCH }
 
 # ---------------------------------------------------------------- state
@@ -45,6 +59,7 @@ var step_speeds: Array = []
 var step_last_motion: Array = []
 var separation_note: String = ""
 var last_result: String = "No pitches yet."
+var cb_cue: String = "doorknob" # chosen CB cue key (CB_CUES), stored with the CB template
 
 var watch_selection: String = "MIX"
 var rng := RandomNumberGenerator.new()
@@ -74,6 +89,13 @@ var ai_root: Node3D
 var ai_arm: MeshInstance3D
 var ai_ball: MeshInstance3D
 var ai_mannequin: Node3D
+# CB cue ghost: a semi-transparent arm in front of the player, looping
+# the chosen cue's motion while the CB enrollment step is active.
+var ghost_root: Node3D
+var ghost_pivot: Node3D
+var ghost_roll_node: Node3D
+var ghost_hand: Node3D
+var ghost_time: float = 0.0
 var ui_click_player: AudioStreamPlayer
 var release_player: AudioStreamPlayer
 
@@ -86,6 +108,8 @@ var hand_btn: Button
 var posture_btn: Button
 var begin_btn: Button
 var skip_btn: Button
+var cue_row: HBoxContainer
+var cue_btns: Dictionary = {} # cue key -> Button
 var watch_row: HBoxContainer
 var boost_slider: HSlider
 var boost_value_label: Label
@@ -118,6 +142,7 @@ func _ready() -> void:
 	_build_board()
 	_build_panel()
 	_build_ai()
+	_build_ghost()
 	_build_audio()
 	_load_profile()
 	_refresh_ui()
@@ -544,6 +569,24 @@ func _build_panel() -> void:
 	re_row.add_child(_btn("Re-enroll 3rd", func() -> void: _start_enrollment(["p3"])))
 	re_row.add_child(_btn("Erase profile", _on_wipe))
 
+	# CB cue picker: only visible while the curveball enrollment step is
+	# active (see _refresh_ui). Pick the picture, watch the ghost arm,
+	# then throw YOUR version of it.
+	cue_row = HBoxContainer.new()
+	cue_row.add_theme_constant_override("separation", 8)
+	vbox.add_child(cue_row)
+	var cue_lbl := Label.new()
+	cue_lbl.text = "CB cue:"
+	cue_lbl.add_theme_font_size_override("font_size", 23)
+	cue_lbl.add_theme_color_override("font_color", Color(1.0, 0.95, 0.8))
+	cue_row.add_child(cue_lbl)
+	for cue_key: String in CB_CUES.keys():
+		var cue_def: Dictionary = CB_CUES[cue_key]
+		var cb_btn: Button = _btn(String(cue_def["label"]), _set_cb_cue.bind(cue_key))
+		cue_btns[cue_key] = cb_btn
+		cue_row.add_child(cb_btn)
+	cue_row.visible = false
+
 	var mode_row := HBoxContainer.new()
 	mode_row.add_theme_constant_override("separation", 8)
 	vbox.add_child(mode_row)
@@ -594,7 +637,7 @@ func _build_panel() -> void:
 	controls.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	controls.add_theme_font_size_override("font_size", 18)
 	controls.add_theme_color_override("font_color", Color(0.55, 0.62, 0.72))
-	controls.text = "CONTROLS - The ball is in your throwing hand (ORANGE band = right hand, CYAN band = left). Throwing hand: squeeze GRIP, throw, let go of GRIP at your release point - your ARM is the throw. Other hand: point the beam at this panel (red = aiming, green = on the panel, dot = where it lands) and pull TRIGGER to click buttons or drag the Boost slider. Quest system button (long-press): recenter. Nothing else is bound."
+	controls.text = "CONTROLS - The ball is in your throwing hand (ORANGE band = right hand, CYAN band = left). Throwing hand: squeeze GRIP, throw, let go of GRIP at your release point - your ARM is the throw. Other hand: point the beam at this panel (red = aiming, green = on the panel, dot = where it lands) and pull TRIGGER to click buttons or drag the Boost slider. During curveball enrollment: pick a cue picture (Doorknob / Shade / Chop) and watch the ghost arm demo it. Quest system button (long-press): recenter. Nothing else is bound."
 	vbox.add_child(controls)
 
 	# DEBUG block (temporary): live XR chain state per hand, so a single
@@ -688,6 +731,15 @@ func _refresh_ui() -> void:
 	watch_row.visible = mode == Mode.WATCH
 	skip_btn.visible = enrolling and enroll_idx < enroll_queue.size() and String(enroll_queue[enroll_idx]) == "p3"
 	begin_btn.visible = not enrolling
+	# The cue picker and the ghost arm exist only for the curveball step.
+	var on_cb_step: bool = enrolling and enroll_idx < enroll_queue.size() and String(enroll_queue[enroll_idx]) == "cb"
+	cue_row.visible = on_cb_step
+	if ghost_root != null:
+		ghost_root.visible = on_cb_step
+	for cue_key: String in cue_btns.keys():
+		var cue_b: Button = cue_btns[cue_key]
+		var cue_d: Dictionary = CB_CUES[cue_key]
+		cue_b.text = ("> " if cue_key == cb_cue else "") + String(cue_d["label"])
 	var enrolled: bool = templates.has("FB") and templates.has("CB")
 	var status: String = ""
 	if not xr_ok:
@@ -719,7 +771,8 @@ func _current_prompt() -> String:
 			"fb":
 				return "Show me your FASTBALL motion (%d of 3)." % [got + 1]
 			"cb":
-				return "Show me your CURVEBALL motion (%d of 3)." % [got + 1]
+				var cue_d: Dictionary = CB_CUES[cb_cue]
+				return "Show me your CURVEBALL motion (%d of 3). Your cue: %s - %s. The ghost arm in front of you is doing it on a loop. Match the PICTURE, then make it yours. The twist is the pitch: at fastball arm speed, the rotation is what the game reads." % [got + 1, String(cue_d["label"]).to_upper(), String(cue_d["desc"])]
 			"p3":
 				return "Optional: show me a THIRD pitch motion (%d of 3) - or press Skip pitch." % [got + 1]
 			"gear_fast":
@@ -749,6 +802,15 @@ func _on_hand_toggle() -> void:
 func _on_posture_toggle() -> void:
 	posture = "SIT" if posture == "STAND" else "STAND"
 	_build_zone()
+	_play_click()
+	_refresh_ui()
+
+
+func _set_cb_cue(cue_key: String) -> void:
+	if not CB_CUES.has(cue_key):
+		return
+	cb_cue = cue_key
+	ghost_time = 0.0 # restart the ghost loop on the new picture
 	_play_click()
 	_refresh_ui()
 
@@ -848,7 +910,13 @@ func _recompute_separation() -> void:
 		var entry: Dictionary = rep[key]
 		if not bool(entry["ok"]):
 			var names: PackedStringArray = key.split("|")
-			separation_note = "WARNING: your %s and %s motions read very similar (distance %.2f, needs %.2f) - the game may mix them up. Re-enroll one with a more distinct motion." % [names[0], names[1], float(entry["distance"]), float(entry["required"])]
+			if bool(entry.get("roll_gap", false)):
+				# Name the actual missing piece: without a twist gap the
+				# two motions differ only in speed, and speed is not a
+				# pitch. Tell him what to add, not just that it failed.
+				separation_note = "WARNING: your %s and %s read very similar (distance %.2f, needs %.2f) - and the twist isn't reading: the roll gap between them is only %.1f rad. A curveball that is just a slower fastball will keep getting mixed up. Re-enroll the CB and put rotation through the release - turn the doorknob, pull the shade, karate chop." % [names[0], names[1], float(entry["distance"]), float(entry["required"]), float(entry.get("roll_delta", 0.0))]
+			else:
+				separation_note = "WARNING: your %s and %s motions read very similar (distance %.2f, needs %.2f) - the game may mix them up. Re-enroll one with a more distinct motion." % [names[0], names[1], float(entry["distance"]), float(entry["required"])]
 			return
 	separation_note = "Separation check: your motions read distinct. Good."
 
@@ -896,7 +964,9 @@ func _physics_process(delta: float) -> void:
 		ring.clear()
 		ball_in_hand_mesh.visible = true
 	if holding:
-		ring.append(ThrowFeatures.make_sample(float(now_msec) / 1000.0, pos, smooth_lv, smooth_av))
+		# Orientation rides along in every sample: the roll features
+		# (ThrowFeatures.roll_metrics) read the wrist's twist from it.
+		ring.append(ThrowFeatures.make_sample_q(float(now_msec) / 1000.0, pos, smooth_lv, smooth_av, basis_now.get_rotation_quaternion()))
 		while ring.size() > 120:
 			ring.pop_front()
 	if holding and prev_grip > 0.3 and grip <= 0.3:
@@ -924,7 +994,11 @@ func _finalize_throw() -> void:
 		_refresh_ui()
 		return
 	var to_plate: Vector3 = (PLATE_POS + Vector3(0.0, 0.9, 0.0) - rel_pos).normalized()
-	if rel_lv.normalized().dot(to_plate) < 0.25:
+	# Sanity-check the throw's INTENT (the peak-speed window's direction),
+	# not the grip-release frame's velocity: the button lets go during
+	# follow-through, when the hand has already turned - judging the throw
+	# by that frame is what made aim feel like darts (seventh pass).
+	if ThrowFeatures.release_intent_dir(samples).dot(to_plate) < 0.25:
 		last_result = "That one wasn't toward the plate - not counted."
 		_refresh_ui()
 		return
@@ -962,6 +1036,10 @@ func _enrollment_throw(features: PackedFloat32Array, speed: float, samples: Arra
 		"fb", "cb", "p3":
 			var key: String = step.to_upper()
 			templates[key] = ThrowFeatures.build_template(step_features)
+			if key == "CB":
+				# The picture he threw to, kept with the template -
+				# flavor now, a coaching hook later.
+				templates[key]["cue"] = cb_cue
 			pitch_release_speed[key] = avg_speed
 			pitch_motions[key] = samples
 			var rel: Dictionary = samples[samples.size() - 1]
@@ -1009,7 +1087,9 @@ func _spawn_visual_flight(samples: Array, features: PackedFloat32Array, pitch: S
 			anchor = maxf(anchor, s)
 	var mph: float = ThrowFeatures.map_velocity(speed, anchor, boost_mult)
 	var spin: Dictionary = ThrowFeatures.spin_params(pitch, ThrowFeatures.roll01_from_features(features))
-	_start_flight(rel_pos, rel_lv.normalized(), mph, pitch, spin["axis"], float(spin["rate"]), {
+	# Flight direction = the arm's intent (peak-speed window), never the
+	# grip-release frame - see release_intent_dir.
+	_start_flight(rel_pos, ThrowFeatures.release_intent_dir(samples), mph, pitch, spin["axis"], float(spin["rate"]), {
 		"quiet": true, "watch": false,
 	})
 
@@ -1035,10 +1115,12 @@ func _free_throw(features: PackedFloat32Array, speed: float, samples: Array) -> 
 		gear = ThrowFeatures.gear_for_speed(speed, fast_anchor, med_anchor)
 	var release: Dictionary = samples[samples.size() - 1]
 	var rel_pos: Vector3 = release["p"]
-	var rel_lv: Vector3 = release["lv"]
 	var spin: Dictionary = ThrowFeatures.spin_params(pitch, ThrowFeatures.roll01_from_features(features))
 	var axis: Vector3 = spin["axis"]
-	_start_flight(rel_pos, rel_lv.normalized(), mph, pitch, axis, float(spin["rate"]), {
+	# Flight direction = release intent (peak-speed window). Speed still
+	# comes from the release sample via the caller's `speed` - magnitude
+	# semantics unchanged, only the direction stopped trusting the button.
+	_start_flight(rel_pos, ThrowFeatures.release_intent_dir(samples), mph, pitch, axis, float(spin["rate"]), {
 		"confidence": confidence, "gear": gear, "watch": false,
 	})
 	release_player.play()
@@ -1074,6 +1156,7 @@ func _start_flight(start: Vector3, dir: Vector3, mph: float, pitch: String, spin
 func _process(delta: float) -> void:
 	_update_flights(delta)
 	_update_ai(delta)
+	_update_ghost(delta)
 
 
 func _update_flights(delta: float) -> void:
@@ -1185,6 +1268,91 @@ func _build_ai() -> void:
 	ai_ball.material_override = _mat(Color(0.96, 0.96, 0.96))
 	ai_ball.visible = false
 	ai_root.add_child(ai_ball)
+
+
+func _ghost_mat(color: Color) -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = Color(color.r, color.g, color.b, 0.38)
+	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	m.emission_enabled = true
+	m.emission = color
+	m.emission_energy_multiplier = 0.55
+	return m
+
+
+# The cue ghost (seventh pass): DE-simple on purpose - one forearm, one
+# hand, one ball, all translucent. Structure: root (placement) -> pivot
+# (the elbow; the delivery SWING rotates here) -> roll node (the forearm
+# TWIST rotates here, about the forearm's own long axis Y) -> hand node
+# (extra over-the-top tilt for the shade cue). No character art; the
+# motion is the information.
+func _build_ghost() -> void:
+	ghost_root = Node3D.new()
+	ghost_root.name = "CueGhost"
+	# In front of the player on the mound, throwing-hand side, angled so
+	# both the delivery arc and the forearm twist read in profile.
+	ghost_root.position = Vector3(0.72, 1.52, -0.95)
+	ghost_root.rotation.y = -0.55
+	add_child(ghost_root)
+	var gmat: StandardMaterial3D = _ghost_mat(Color(0.45, 0.9, 1.0))
+	ghost_pivot = Node3D.new()
+	ghost_root.add_child(ghost_pivot)
+	ghost_roll_node = Node3D.new()
+	ghost_pivot.add_child(ghost_roll_node)
+	var fore_mesh := CapsuleMesh.new()
+	fore_mesh.radius = 0.035
+	fore_mesh.height = 0.34
+	var fore := MeshInstance3D.new()
+	fore.mesh = fore_mesh
+	fore.material_override = gmat
+	fore.position = Vector3(0.0, -0.15, 0.0)
+	ghost_roll_node.add_child(fore)
+	ghost_hand = Node3D.new()
+	ghost_hand.position = Vector3(0.0, -0.32, 0.0)
+	ghost_roll_node.add_child(ghost_hand)
+	var palm_mesh := BoxMesh.new()
+	palm_mesh.size = Vector3(0.075, 0.03, 0.095)
+	var palm := MeshInstance3D.new()
+	palm.mesh = palm_mesh
+	palm.material_override = gmat
+	ghost_hand.add_child(palm)
+	var gball_mesh := SphereMesh.new()
+	gball_mesh.radius = BALL_R
+	gball_mesh.height = BALL_R * 2.0
+	var gball := MeshInstance3D.new()
+	gball.mesh = gball_mesh
+	gball.material_override = _ghost_mat(Color(1.0, 0.98, 0.9))
+	gball.position = Vector3(0.0, -0.025, -0.03)
+	ghost_hand.add_child(gball)
+	ghost_root.visible = false
+
+
+# Loop: wind back (0-60% of the cycle), hold the finish a beat, float
+# back. The twist follows the chosen cue's profile: it starts at the
+# cue's roll_start fraction of the delivery and eases to the cue's full
+# roll; the shade adds its over-the-top hand tilt on the same envelope.
+func _update_ghost(delta: float) -> void:
+	if ghost_root == null or not ghost_root.visible:
+		return
+	ghost_time += delta
+	var cue_d: Dictionary = CB_CUES[cb_cue]
+	var phase: float = fmod(ghost_time / 2.4, 1.0)
+	var u: float
+	if phase < 0.6:
+		var a: float = phase / 0.6
+		u = a * a * (3.0 - 2.0 * a)
+	elif phase < 0.75:
+		u = 1.0
+	else:
+		var b: float = (phase - 0.75) / 0.25
+		u = 1.0 - b * b * (3.0 - 2.0 * b)
+	ghost_pivot.rotation.x = lerpf(-0.95, 0.72, u)
+	ghost_pivot.rotation.z = lerpf(0.12, -0.06, u)
+	var roll_start: float = float(cue_d["roll_start"])
+	var prog: float = clampf((u - roll_start) / maxf(1.0 - roll_start, 0.01), 0.0, 1.0)
+	var roll_e: float = prog * prog * (3.0 - 2.0 * prog)
+	ghost_roll_node.rotation.y = float(cue_d["roll"]) * roll_e
+	ghost_hand.rotation.x = float(cue_d["hand_pitch"]) * roll_e
 
 
 func _on_throw_it() -> void:
@@ -1347,7 +1515,7 @@ func _save_profile() -> void:
 	if calib_max <= 0.01 and templates.is_empty():
 		return
 	var data: Dictionary = {
-		"version": 1,
+		"version": ThrowFeatures.PROFILE_VERSION,
 		"hand": throwing_hand,
 		"posture": posture,
 		"calib_max": calib_max,
@@ -1365,7 +1533,7 @@ func _save_profile() -> void:
 		var arr: Array = []
 		for v: float in feats:
 			arr.append(v)
-		tpl_out[pitch] = {"features": arr, "spread": float(tpl["spread"])}
+		tpl_out[pitch] = {"features": arr, "spread": float(tpl["spread"]), "cue": String(tpl.get("cue", ""))}
 	data["templates"] = tpl_out
 	var pitch_out: Dictionary = {}
 	for pitch2: String in pitch_motions.keys():
@@ -1400,6 +1568,16 @@ func _load_profile() -> void:
 		var sp: Dictionary = saved_pbs
 		for k: String in sp.keys():
 			pbs[k] = float(sp[k])
+	# Profile format gate (seventh pass): v1 templates hold 12-feature
+	# vectors; the v2 classifier reads 15 (forearm roll added). Restoring
+	# them would silently misread every throw, so templates and their
+	# pitch data are DROPPED here, never converted. Calibration, gears,
+	# PBs, hand, posture and boost are plain scalars in a compatible
+	# form and carry over - only the pitches need re-enrolling.
+	var classifier_upgraded: bool = int(data.get("version", 1)) < ThrowFeatures.PROFILE_VERSION
+	if classifier_upgraded:
+		data["templates"] = {}
+		data["pitches"] = {}
 	var tpl_in: Variant = data.get("templates", {})
 	if tpl_in is Dictionary:
 		var td: Dictionary = tpl_in
@@ -1410,7 +1588,13 @@ func _load_profile() -> void:
 			for v: Variant in farr:
 				feats.append(float(v))
 			if feats.size() == ThrowFeatures.FEATURE_COUNT:
-				templates[pitch] = {"features": feats, "spread": float(entry.get("spread", 0.0))}
+				var tpl_entry: Dictionary = {"features": feats, "spread": float(entry.get("spread", 0.0))}
+				var saved_cue: String = String(entry.get("cue", ""))
+				if saved_cue != "":
+					tpl_entry["cue"] = saved_cue
+					if pitch == "CB" and CB_CUES.has(saved_cue):
+						cb_cue = saved_cue
+				templates[pitch] = tpl_entry
 	var pitch_in: Variant = data.get("pitches", {})
 	if pitch_in is Dictionary:
 		var pd: Dictionary = pitch_in
@@ -1424,7 +1608,9 @@ func _load_profile() -> void:
 			pitch_motions[pitch2] = _motion_from_rows(rows)
 	_build_zone()
 	_recompute_separation()
-	if templates.has("FB") and templates.has("CB"):
+	if classifier_upgraded:
+		last_result = "Classifier upgraded - it now reads wrist roll, so your saved pitch motions can't be used (they were measured without it). Calibration, gears and PBs carried over. Re-enroll your pitches when ready."
+	elif templates.has("FB") and templates.has("CB"):
 		mode = Mode.FREE_THROW
 		last_result = "Profile loaded - free throw is live, or go to the box to watch."
 	# Ball visual follows the loaded throwing hand.

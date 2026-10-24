@@ -94,6 +94,20 @@ func _run() -> void:
 		(f["node"] as Node).queue_free()
 	main.flights.clear()
 
+	# CB cue flow (seventh pass): the cue picker and the ghost arm exist
+	# only on the curveball step; the picked picture is stored with the
+	# CB template. Drive a CB-only enrollment first.
+	main._start_enrollment(["cb"])
+	check(main.cue_row.visible, "cue picker shows on the CB step")
+	check(main.ghost_root.visible, "ghost arm demos on the CB step")
+	check(main.prompt_label.text.contains("DOORKNOB"), "CB prompt names the default cue (doorknob)")
+	main._set_cb_cue("shade")
+	check(main.cb_cue == "shade", "cue picker switches the cue")
+	feed(main, true, 6.3, 3)
+	check(String(main.templates["CB"].get("cue", "")) == "shade", "chosen cue stored with the CB template")
+	check(not main.ghost_root.visible, "ghost arm hides when the CB step ends")
+	check(not main.cue_row.visible, "cue picker hides when the CB step ends")
+
 	# Enrollment, driven exactly as grip throws would drive it.
 	main._start_enrollment(["calib", "fb", "cb", "p3", "gear_fast", "gear_med"])
 	feed(main, false, 8.0, 3) # calib
@@ -134,6 +148,28 @@ func _run() -> void:
 	main.templates.clear()
 	main._load_profile()
 	check(main.templates.has("FB") and main.templates.has("CB"), "profile reload restores templates")
+	check(String(main.templates["CB"].get("cue", "")) == "shade", "profile reload restores the CB cue on the template")
+	check(main.cb_cue == "shade", "profile reload restores the cue picker selection")
+
+	# Profile v1 -> v2 upgrade (seventh pass): the v1 file's templates
+	# hold 12-feature vectors the v2 classifier must NOT silently read.
+	# Graceful path: templates dropped with a panel explanation, the
+	# calibration scalars carry over.
+	var v1_feats: Array = []
+	for vi: int in 12:
+		v1_feats.append(0.1 * float(vi))
+	var v1_data: Dictionary = {
+		"version": 1, "hand": "R", "posture": "STAND",
+		"calib_max": 7.7, "boost": 1.0, "fast_anchor": 7.6, "med_anchor": 6.6,
+		"pbs": {}, "templates": {"FB": {"features": v1_feats, "spread": 0.3}}, "pitches": {},
+	}
+	check(ProfileStore.save_profile("user://duel_profile.json", v1_data), "v1 profile written for the upgrade test")
+	main.templates.clear()
+	main.calib_max = 0.0
+	main._load_profile()
+	check(main.templates.is_empty(), "v1 templates are dropped, not misread by the v2 classifier")
+	check(absf(main.calib_max - 7.7) < 0.01, "v1 calibration carries over (%.2f)" % main.calib_max)
+	check(main.last_result.contains("Re-enroll"), "panel explains the upgrade and the re-enroll")
 	main._on_wipe()
 	check(main.templates.is_empty() and not FileAccess.file_exists("user://duel_profile.json"),
 		"wipe clears templates and deletes the profile file (no test data leaks into Chris's first run)")
