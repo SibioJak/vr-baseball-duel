@@ -941,7 +941,14 @@ func _enrollment_throw(features: PackedFloat32Array, speed: float, samples: Arra
 	step_features.append(features)
 	step_speeds.append(speed)
 	step_last_motion = samples
+	# An accepted throw always flies, in every mode - a pitch you throw but
+	# cannot watch feels broken even when the counter ticks. Enrollment
+	# flights are "quiet": no gun-board post, no PB, the panel counting text
+	# below stays the feedback channel. (Sixth pass, Chris's field report.)
+	_spawn_visual_flight(samples, features, _enrollment_flight_pitch(step))
 	last_result = "Counted: %.2f m/s (%d mph raw)." % [speed, int(round(speed * ThrowFeatures.MPH_PER_MPS))]
+	if step == "calib" and calib_max <= 0.01:
+		last_result += " The ball still flies, but that is visual only - the gun stays dark until calibration lands."
 	if step_speeds.size() < _step_target_count():
 		return
 	var avg_speed: float = 0.0
@@ -971,8 +978,48 @@ func _enrollment_throw(features: PackedFloat32Array, speed: float, samples: Arra
 	_advance_step()
 
 
+## The flight character an enrollment step throws with: calibration and
+## both velocity gears fly as fastballs, the curve step flies with the
+## curve's break (from this throw's own roll feature, via spin_params).
+func _enrollment_flight_pitch(step: String) -> String:
+	match step:
+		"cb":
+			return "CB"
+		"p3":
+			return "P3"
+	return "FB"
+
+
+## Spawn a visible flight for a throw the classifier is not scoring:
+## enrollment throws and pre-enrollment "just a throw" tosses. Speed uses
+## the normal map when a calibration exists; before one lands, the anchor
+## is the fastest accepted throw of the current step (or this throw), so
+## the ball leaves at a believable pace and never looks lobbed. The flight
+## is flagged "quiet" - _update_flights will not announce it on the gun
+## board, record a PB, or overwrite the panel's result text.
+func _spawn_visual_flight(samples: Array, features: PackedFloat32Array, pitch: String) -> void:
+	var release: Dictionary = samples[samples.size() - 1]
+	var rel_pos: Vector3 = release["p"]
+	var rel_lv: Vector3 = release["lv"]
+	var speed: float = rel_lv.length()
+	var anchor: float = calib_max
+	if anchor <= 0.01:
+		anchor = speed
+		for s: float in step_speeds:
+			anchor = maxf(anchor, s)
+	var mph: float = ThrowFeatures.map_velocity(speed, anchor, boost_mult)
+	var spin: Dictionary = ThrowFeatures.spin_params(pitch, ThrowFeatures.roll01_from_features(features))
+	_start_flight(rel_pos, rel_lv.normalized(), mph, pitch, spin["axis"], float(spin["rate"]), {
+		"quiet": true, "watch": false,
+	})
+
+
 func _free_throw(features: PackedFloat32Array, speed: float, samples: Array) -> void:
 	if not (templates.has("FB") and templates.has("CB")):
+		# No templates yet: the throw still flies as an unclassified "just a
+		# throw" at provisionally mapped speed - a new player who ignores the
+		# panel and throws sees a ball go. Gun board stays dark (quiet).
+		_spawn_visual_flight(samples, features, "FB")
 		last_result = "Enroll a fastball and a curveball first - then the gun goes live."
 		return
 	# Sandbag guard (per spec): beating your calibrated max re-anchors it.
@@ -1046,7 +1093,10 @@ func _update_flights(delta: float) -> void:
 		var meta: Dictionary = f["meta"]
 		if not bool(f["announced"]) and node.position.z <= PLATE_POS.z + 0.05:
 			f["announced"] = true
-			_announce(meta)
+			# Quiet flights (enrollment / pre-enrollment) are visual only:
+			# no gun-board post, no PB, no result-text overwrite.
+			if not bool(meta.get("quiet", false)):
+				_announce(meta)
 		if elapsed > float(f["total"]) + 0.6:
 			node.queue_free()
 			flights.remove_at(i)

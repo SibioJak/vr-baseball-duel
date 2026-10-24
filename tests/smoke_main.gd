@@ -83,6 +83,17 @@ func _run() -> void:
 	await create_timer(0.2).timeout
 	check(main != null, "main scene instantiated")
 
+	# Pre-enrollment throw: no templates yet, but the ball must still fly
+	# ("just a throw") and the gun board stays dark for it.
+	var stray_motion: Array = make_motion(7.5, false)
+	var stray_feats: PackedFloat32Array = ThrowFeatures.extract_features(stray_motion)
+	main._free_throw(stray_feats, 7.5, stray_motion)
+	check(main.flights.size() == 1, "pre-enrollment throw produced a flight")
+	check(main.last_result.begins_with("Enroll a fastball"), "pre-enrollment throw explained on the panel")
+	for f: Dictionary in main.flights:
+		(f["node"] as Node).queue_free()
+	main.flights.clear()
+
 	# Enrollment, driven exactly as grip throws would drive it.
 	main._start_enrollment(["calib", "fb", "cb", "p3", "gear_fast", "gear_med"])
 	feed(main, false, 8.0, 3) # calib
@@ -94,6 +105,8 @@ func _run() -> void:
 	feed(main, false, 8.05, 2) # gear fast
 	feed(main, false, 6.9, 2) # gear medium
 	check(not main.enrolling, "enrollment completed")
+	check(main.flights.size() >= 10,
+		"enrollment throws all flew (quiet) - %d in the air" % main.flights.size())
 	check(main.fast_anchor > 7.9 and main.med_anchor > 6.7 and main.med_anchor < main.fast_anchor,
 		"gears anchored (FAST %.2f / MED %.2f)" % [main.fast_anchor, main.med_anchor])
 	check(main.mode == 2 or main.mode == 1, "mode left SETUP after enrollment (mode=%d)" % main.mode)
@@ -102,8 +115,9 @@ func _run() -> void:
 	# Free throw: classified, flown, announced.
 	var fb_motion: Array = make_motion(7.9, false)
 	var fb_feats: PackedFloat32Array = ThrowFeatures.extract_features(fb_motion)
+	var flights_before: int = main.flights.size()
 	main._free_throw(fb_feats, 7.9, fb_motion)
-	check(main.flights.size() == 1, "free throw produced a flight")
+	check(main.flights.size() == flights_before + 1, "free throw produced a flight")
 	await create_timer(1.6).timeout
 	check(main.last_result.begins_with("Gun:"), "gun announced the pitch (%s)" % main.last_result)
 	check(main.pbs.has("FB"), "personal best recorded")
