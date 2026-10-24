@@ -89,6 +89,8 @@ var skip_btn: Button
 var watch_row: HBoxContainer
 var boost_slider: HSlider
 var boost_value_label: Label
+var debug_label: Label
+var debug_tick: int = 0
 
 # ---------------------------------------------------------------- sampling
 var holding: bool = false
@@ -263,7 +265,14 @@ func _build_rig() -> void:
 		fallback.look_at(Vector3(0.0, 1.0, PLATE_POS.z), Vector3.UP)
 		fallback.current = true
 	for hand: String in ["L", "R"]:
-		var tracker_name: StringName = &"left_hand" if hand == "L" else &"right_hand"
+		# Tracker names are the OpenXR user paths - this is exactly what
+		# PVLDS (Chris's working launcher, same PC/Quest/VD) uses. The
+		# shipped build used "left_hand"/"right_hand": no such trackers
+		# exist in the real runtime, so on hardware the controllers never
+		# got a pose, get_is_active() stayed false, and the reps/beam/ball
+		# all stayed hidden - while the render test fed fake trackers
+		# under those same wrong names and reported everything alive.
+		var tracker_name: StringName = &"/user/hand/left" if hand == "L" else &"/user/hand/right"
 		var g := XRController3D.new()
 		g.tracker = tracker_name
 		g.pose = &"grip_pose"
@@ -587,6 +596,16 @@ func _build_panel() -> void:
 	controls.text = "CONTROLS - The ball is in your throwing hand (ORANGE band = right hand, CYAN band = left). Throwing hand: squeeze GRIP, throw, let go of GRIP at your release point - your ARM is the throw. Other hand: point the beam at this panel (red = aiming, green = on the panel, dot = where it lands) and pull TRIGGER to click buttons or drag the Boost slider. Quest system button (long-press): recenter. Nothing else is bound."
 	vbox.add_child(controls)
 
+	# DEBUG block (temporary): live XR chain state per hand, so a single
+	# headset screenshot shows exactly which link is dead - tracker
+	# registered? pose tracking? controller active? input values moving?
+	debug_label = Label.new()
+	debug_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	debug_label.add_theme_font_size_override("font_size", 17)
+	debug_label.add_theme_color_override("font_color", Color(1.0, 0.85, 0.3))
+	debug_label.text = "DEBUG: waiting for first update..."
+	vbox.add_child(debug_label)
+
 	panel_root = Node3D.new()
 	add_child(panel_root)
 	_box(panel_root, Vector3.ZERO, Vector3(PANEL_M.x + 0.06, PANEL_M.y + 0.06, 0.04), _mat(Color(0.06, 0.07, 0.1)))
@@ -833,6 +852,9 @@ func _recompute_separation() -> void:
 
 func _physics_process(delta: float) -> void:
 	_update_pointer(delta)
+	debug_tick += 1
+	if debug_tick % 9 == 0:
+		_update_debug()
 	# Controller representations show whenever their controller is tracked.
 	for h: String in ["L", "R"]:
 		var rep: Node3D = ctrl_rep[h]
@@ -1381,6 +1403,35 @@ func _motion_from_rows(rows: Array) -> Array:
 
 func _off_hand() -> String:
 	return "L" if throwing_hand == "R" else "R"
+
+
+# DEBUG (temporary): one line per hand tracing the whole input chain -
+# XRServer tracker registered -> pose has tracking data -> controller
+# active -> live position and analog values. If controllers ever go
+# missing again, this block on a screenshot names the dead link.
+func _debug_hand_line(hand: String) -> String:
+	var tname: StringName = &"/user/hand/left" if hand == "L" else &"/user/hand/right"
+	var grip_c: XRController3D = grip_ctrl[hand]
+	var aim_c: XRController3D = aim_ctrl[hand]
+	var tracker: XRPositionalTracker = XRServer.get_tracker(tname)
+	var found: String = "FOUND" if tracker != null else "MISSING"
+	var pose_state: String = "NO-TRACKER"
+	if tracker != null:
+		var pose: XRPose = tracker.get_pose(&"grip_pose")
+		pose_state = "POSE-OK" if pose != null and pose.has_tracking_data else "NO-POSE"
+	var pos: Vector3 = grip_c.global_position
+	return "%s: tracker %s %s | active G:%s A:%s | pos (%.2f, %.2f, %.2f) | grip %.2f trig %.2f" % [
+		hand, found, pose_state,
+		str(grip_c.get_is_active()), str(aim_c.get_is_active()),
+		pos.x, pos.y, pos.z,
+		_input_float(grip_c, &"grip"), _input_float(aim_c, &"trigger")]
+
+
+func _update_debug() -> void:
+	if debug_label == null:
+		return
+	debug_label.text = "DEBUG - xr_ok: %s\n%s\n%s" % [
+		str(xr_ok), _debug_hand_line("L"), _debug_hand_line("R")]
 
 
 func _update_pointer(delta: float) -> void:
