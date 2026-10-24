@@ -8,19 +8,20 @@ extends SceneTree
 ## Feeds fake positional trackers so the XR controllers take the pose a
 ## standing player would have, then asserts the things the first headset
 ## run got wrong - none of which the logic tests could see:
-## SECOND headset run lesson: the fake trackers must use the REAL runtime
-## tracker names ("/user/hand/left", "/user/hand/right" - the OpenXR user
-## paths, same as PVLDS). The first version of this test fed trackers
-## named "left_hand"/"right_hand", matching the production bug exactly,
-## so the harness glowed green while real Touch controllers stayed dead.
-## THIRD headset run lesson: with the names fixed but TWO controller
-## nodes per hand (explicit grip_pose/aim_pose), the field DEBUG block
-## showed XRServer.get_tracker(user path) returning NULL - the runtime
-## registered no hand trackers in this app at all. PVLDS uses ONE node
-## per hand with the pose left at the class default. This test now
-## asserts that exact rig shape so the rig cannot drift back, and feeds
-## the fake trackers a pose under the default name ("default") that the
-## single nodes actually follow.
+## Tracker names, settled by the FIELD CENSUS (fourth pass): the
+## headset DEBUG block (session FOCUSED) showed XRServer holding 19
+## trackers, the hands registered as plain "left_hand"/"right_hand"
+## [CONTROLLER] with live data ONLY on the "default" (and "palm_pose")
+## poses. So the fake trackers here use those plain names and feed a
+## "default" pose. Both earlier turns were wrong in opposite
+## directions: pass 1 fed/bound the plain names but production split
+## nodes across explicit grip_pose/aim_pose (poses with no data on
+## this rig, so controllers never activated), and passes 2-3 fed -
+## and bound - the OpenXR user paths ("/user/hand/...", copied from
+## PVLDS), which XRServer here never registers at all. The guards
+## below pin the census-correct binding so the rig cannot drift back:
+## tracker == "left_hand"/"right_hand", pose left at class default,
+## ONE node per hand (the pass-3 shape, which was right).
 ##   * the held ball is visible from spawn, in the throwing hand
 ##   * both controller representations exist and show while tracked
 ##   * the panel's UI quad sits on the PLAYER side of its backing plate
@@ -109,22 +110,23 @@ func _run() -> void:
 	# The single node per hand follows the "default" pose: for the off
 	# (left) hand feed the aim transform there so its beam lands on the
 	# panel; for the throwing (right) hand feed the grip transform.
-	feed_tracker(&"/user/hand/left", XRPositionalTracker.TRACKER_HAND_LEFT, l_aim, l_grip, l_aim)
-	feed_tracker(&"/user/hand/right", XRPositionalTracker.TRACKER_HAND_RIGHT, r_grip, r_grip, r_aim)
+	feed_tracker(&"left_hand", XRPositionalTracker.TRACKER_HAND_LEFT, l_aim, l_grip, l_aim)
+	feed_tracker(&"right_hand", XRPositionalTracker.TRACKER_HAND_RIGHT, r_grip, r_grip, r_aim)
 
-	# Regression guards, PVLDS shape (third pass): exactly ONE
-	# XRController3D per hand, tracker on the OpenXR user path, pose
-	# left at the class default ("default") - never an explicit
-	# grip_pose/aim_pose node split. Pass 2 fixed only the names and
-	# the runtime still registered no hand trackers on hardware.
+	# Regression guards, field-census binding (fourth pass): exactly
+	# ONE XRController3D per hand, tracker bound to the plain name the
+	# headset census showed XRServer registering ("left_hand"/
+	# "right_hand" - NOT the OpenXR user paths), pose left at the
+	# class default ("default" - the pose the census showed carrying
+	# live data; never an explicit grip_pose/aim_pose node split).
 	var rig_ctrls: Array[Node] = main.origin.find_children("*", "XRController3D", true, false)
 	check(rig_ctrls.size() == 2, "rig has exactly ONE XRController3D per hand (found %d)" % rig_ctrls.size())
 	check(main.hand_ctrl.size() == 2, "hand_ctrl holds exactly two controllers")
 	for hg: String in ["L", "R"]:
 		var hc: XRController3D = main.hand_ctrl[hg]
-		var want: StringName = &"/user/hand/left" if hg == "L" else &"/user/hand/right"
-		check(hc.tracker == want, "%s controller bound to %s" % [hg, String(want)])
-		check(hc.pose == &"default", "%s controller pose left at class default (PVLDS shape)" % hg)
+		var want: StringName = &"left_hand" if hg == "L" else &"right_hand"
+		check(hc.tracker == want, "%s controller bound to %s (field census tracker name)" % [hg, String(want)])
+		check(hc.pose == &"default", "%s controller pose left at class default (field census live pose)" % hg)
 
 	# Photo camera where the player's head is.
 	var photo_cam := Camera3D.new()
@@ -146,7 +148,7 @@ func _run() -> void:
 	check(main.debug_label.text.contains("DEBUG"), "DEBUG block is updating")
 	check(main.debug_label.text.contains("FOUND"), "DEBUG block sees the fed trackers as FOUND")
 	check(main.debug_label.text.contains("XRServer trackers"), "DEBUG census line present (DEBUG v2 enumeration)")
-	check(main.debug_label.text.contains("/user/hand/left"), "DEBUG census lists the left hand tracker by name")
+	check(main.debug_label.text.contains("left_hand"), "DEBUG census lists the left hand tracker by name (left_hand, field census)")
 	for h2: String in ["L", "R"]:
 		var rep2: Node3D = main.ctrl_rep[h2]
 		check(rep2.visible, "controller representation visible while tracked (%s)" % h2)

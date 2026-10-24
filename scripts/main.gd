@@ -264,24 +264,26 @@ func _build_rig() -> void:
 		fallback.look_at(Vector3(0.0, 1.0, PLATE_POS.z), Vector3.UP)
 		fallback.current = true
 	for hand: String in ["L", "R"]:
-		# PVLDS shape, copied exactly (third fix pass). PVLDS - Chris's
-		# working launcher on this same PC/Quest/VD - creates ONE
-		# XRController3D per hand, sets ONLY .tracker to the OpenXR user
-		# path, and never touches .pose (it stays the class default,
-		# "default"). This rig's history: pass 1 shipped tracker names
-		# "left_hand"/"right_hand", which no runtime registers. Pass 2
-		# fixed the names but kept TWO nodes per hand with explicit
-		# grip_pose/aim_pose - and the field DEBUG block then showed
-		# XRServer.get_tracker("/user/hand/...") returning NULL in this
-		# app while the HMD tracked fine: the runtime never registered
-		# hand trackers at all under the two-node pose-split shape, so
-		# every controller stayed inactive at the origin. So now: one
-		# node per hand, default pose, everything (rep, pointer, held
-		# ball, throw sampling) derived from that single node - and
-		# where a caller genuinely needs the aim/grip distinction it
-		# reads tracker.get_pose() off the XRPositionalTracker instead
-		# of spawning a second node.
-		var tracker_name: StringName = &"/user/hand/left" if hand == "L" else &"/user/hand/right"
+		# Rig binding, settled by FIELD EVIDENCE (fourth fix pass). The
+		# headset DEBUG census - session FOCUSED, HMD tracking fine -
+		# showed XRServer holding 19 trackers on this rig (Quest 3,
+		# Virtual Desktop/VDXR, Godot 4.7), the hands registered as
+		# plain "left_hand" / "right_hand" [CONTROLLER] with live data
+		# ONLY on the "default" (and "palm_pose") poses. So: tracker =
+		# "left_hand"/"right_hand", .pose never touched (class default
+		# "default" - the pose that carries data). One node per hand,
+		# everything (rep, pointer, held ball, throw sampling) derived
+		# from that single node - that shape (pass 3) was right; only
+		# the names were wrong. TWO wrong turns are on record; do not
+		# repeat either: (1) pass 1 bound these same plain names but
+		# set explicit grip_pose/aim_pose on split nodes - those poses
+		# carry no data here, so the nodes never went active (this is
+		# why run #1 had no controls despite correct names); (2)
+		# passes 2-3 "fixed" the names to the OpenXR user paths
+		# ("/user/hand/left|right", copied from PVLDS) - XRServer on
+		# this rig registers NO trackers under those names, so every
+		# lookup returned null. Trust the census, not analogies.
+		var tracker_name: StringName = &"left_hand" if hand == "L" else &"right_hand"
 		var c := XRController3D.new()
 		c.tracker = tracker_name
 		origin.add_child(c)
@@ -1411,7 +1413,10 @@ func _off_hand() -> String:
 # ever missing again, this census shows what the runtime DID register
 # (head only? hands under unexpected names?) and ends name-guessing.
 func _hand_tracker_name(hand: String) -> StringName:
-	return &"/user/hand/left" if hand == "L" else &"/user/hand/right"
+	# Plain names, per the field census (see _build_rig): XRServer on
+	# this rig registers the hands as "left_hand"/"right_hand", NOT
+	# under the OpenXR user paths.
+	return &"left_hand" if hand == "L" else &"right_hand"
 
 
 # XRPositionalTracker cannot enumerate its own poses, so probe the
