@@ -59,6 +59,7 @@ var zone_bottom: float = 0.48
 var zone_top: float = 1.06
 var panel_root: Node3D
 var panel_viewport: SubViewport
+var panel_quad: MeshInstance3D
 var panel_area: Area3D
 var ctrl_rep: Dictionary = {} # "L"/"R" -> Node3D controller representation root
 var pointer_ray_by_hand: Dictionary = {} # "L"/"R" -> RayCast3D on the aim controller
@@ -609,15 +610,19 @@ func _build_panel() -> void:
 	panel_root = Node3D.new()
 	add_child(panel_root)
 	_box(panel_root, Vector3.ZERO, Vector3(PANEL_M.x + 0.06, PANEL_M.y + 0.06, 0.04), _mat(Color(0.06, 0.07, 0.1)))
-	var quad := _viewport_quad(panel_viewport, PANEL_M)
+	panel_quad = _viewport_quad(panel_viewport, PANEL_M)
 	# The root's -Z faces the player (look_at), so the PLAYER side of the
 	# backing plate is local -Z: the quad must sit at z = -0.03 with its
 	# front turned toward the player (rotation.y = PI). The shipped build
 	# had +0.03 - the plate (z -0.02..+0.02) hid the UI completely and all
 	# Chris saw was a giant dark slab.
-	quad.rotation.y = PI
-	quad.position = Vector3(0.0, 0.0, -0.03)
-	panel_root.add_child(quad)
+	# NOTE: the PI flip means the rendered texture's u axis runs OPPOSITE
+	# to panel-local +X. Pointer picking therefore maps hits through
+	# panel_quad's own transform (see _update_pointer) - never through
+	# panel_root space, which mirrors the injected position (fifth pass).
+	panel_quad.rotation.y = PI
+	panel_quad.position = Vector3(0.0, 0.0, -0.03)
+	panel_root.add_child(panel_quad)
 	panel_area = Area3D.new()
 	panel_area.collision_layer = 4
 	panel_area.collision_mask = 0
@@ -1513,10 +1518,20 @@ func _update_pointer(delta: float) -> void:
 		var hit: Vector3 = ray.get_collision_point()
 		ray_len = off_ctrl.global_position.distance_to(hit)
 		hitm.position = off_ctrl.to_local(hit)
-		var local: Vector3 = panel_root.global_transform.affine_inverse() * hit
-		var u: float = clampf(local.x / PANEL_M.x + 0.5, 0.0, 1.0)
-		var v: float = clampf(0.5 - local.y / PANEL_M.y, 0.0, 1.0)
-		var vp_pos := Vector2(u * float(PANEL_PX.x), v * float(PANEL_PX.y))
+		# Map the hit through the RENDERED QUAD's own space - the single
+		# source of truth (mesh size read from the actual QuadMesh,
+		# pixels from the actual SubViewport). The quad is rotated PI
+		# about Y inside panel_root, so its texture u runs opposite to
+		# panel-local +X; the old formula converted in panel_root space
+		# and injected a MIRRORED position - point at a button and the
+		# one to its right lit up (Chris's field report, fifth pass).
+		# In quad-local space, +X is the texture's +u by the mesh's own
+		# UV convention, whatever the panel's world pose is.
+		var q_local: Vector3 = panel_quad.global_transform.affine_inverse() * hit
+		var quad_size: Vector2 = (panel_quad.mesh as QuadMesh).size
+		var u: float = clampf(q_local.x / quad_size.x + 0.5, 0.0, 1.0)
+		var v: float = clampf(0.5 - q_local.y / quad_size.y, 0.0, 1.0)
+		var vp_pos := Vector2(u * float(panel_viewport.size.x), v * float(panel_viewport.size.y))
 		var motion_ev := InputEventMouseMotion.new()
 		motion_ev.position = vp_pos
 		panel_viewport.push_input(motion_ev)

@@ -28,7 +28,15 @@ extends SceneTree
 ##     (the shipped bug: it was behind the plate - a giant dark slab)
 ##   * the off-hand ray physically collides with the panel area and the
 ##     beam + hit marker show while hovering
-##   * a click pushed through the panel viewport really fires a button
+##   * FIFTH PASS - panel AIM accuracy through the production picking
+##     path: the field bug was a mirrored u (the panel quad is rotated
+##     PI about Y, so its texture u runs opposite to panel-local +X,
+##     and the old conversion ran in panel-root space - point at a
+##     button and the one to its right lit). The aim checks below aim
+##     the beam at world points derived from the buttons' laid-out
+##     rects mapped through the RENDERED quad's transform/size -
+##     never through the picking code's own constants - and assert
+##     the pointed-at button (not a neighbor) hovers and clicks.
 ## and saves the rendered frame to tests/spawn_view.png for eyeballs.
 
 var failures: int = 0
@@ -57,6 +65,51 @@ func feed_tracker(tracker_name: StringName, hand: int, node_tf: Transform3D, gri
 	t.set_pose(&"default", node_tf, Vector3.ZERO, Vector3.ZERO, XRPose.XR_TRACKING_CONFIDENCE_HIGH)
 	t.set_pose(&"grip_pose", grip_tf, Vector3.ZERO, Vector3.ZERO, XRPose.XR_TRACKING_CONFIDENCE_HIGH)
 	t.set_pose(&"aim_pose", aim_tf, Vector3.ZERO, Vector3.ZERO, XRPose.XR_TRACKING_CONFIDENCE_HIGH)
+
+
+## World position of a panel button's center, derived independently of
+## main.gd's picking code: the button's laid-out rect in the SubViewport
+## (UI ground truth) -> UV -> quad-local point via the QuadMesh UV
+## convention (u along the mesh's own +X) -> world via the rendered
+## quad node's actual global transform and mesh size (scene ground
+## truth). If the production hit->UV map disagrees with where the
+## renderer actually draws the button, the checks below fail.
+func button_world_point(btn: Button) -> Vector3:
+	var quad: MeshInstance3D = main.panel_quad
+	var qsize: Vector2 = (quad.mesh as QuadMesh).size
+	var center_px: Vector2 = btn.get_global_rect().get_center()
+	var uv := Vector2(
+		center_px.x / float(main.panel_viewport.size.x),
+		center_px.y / float(main.panel_viewport.size.y))
+	var lp := Vector3((uv.x - 0.5) * qsize.x, (0.5 - uv.y) * qsize.y, 0.0)
+	return quad.global_transform * lp
+
+
+func aim_tracker_at(tracker_name: StringName, from_pos: Vector3, world_point: Vector3) -> void:
+	var t: XRPositionalTracker = XRServer.get_tracker(tracker_name) as XRPositionalTracker
+	var tf := Transform3D(Basis.looking_at((world_point - from_pos).normalized(), Vector3.UP), from_pos)
+	t.set_pose(&"default", tf, Vector3.ZERO, Vector3.ZERO, XRPose.XR_TRACKING_CONFIDENCE_HIGH)
+	t.set_pose(&"grip_pose", tf, Vector3.ZERO, Vector3.ZERO, XRPose.XR_TRACKING_CONFIDENCE_HIGH)
+	t.set_pose(&"aim_pose", tf, Vector3.ZERO, Vector3.ZERO, XRPose.XR_TRACKING_CONFIDENCE_HIGH)
+
+
+func set_trigger(tracker_name: StringName, value: float) -> void:
+	var t: XRPositionalTracker = XRServer.get_tracker(tracker_name) as XRPositionalTracker
+	t.set_input(&"trigger", value)
+
+
+func settle(phys_frames: int = 6) -> void:
+	for i: int in phys_frames:
+		await physics_frame
+	for j: int in 3:
+		await process_frame
+
+
+func click_via_beam(tracker_name: StringName) -> void:
+	set_trigger(tracker_name, 1.0)
+	await settle(4)
+	set_trigger(tracker_name, 0.0)
+	await settle(4)
 
 
 func _init() -> void:
@@ -176,22 +229,46 @@ func _run() -> void:
 			distinct[img.get_pixel(x, y).to_rgba32()] = true
 	check(distinct.size() > 25, "rendered frame is a real scene, not a flat void (%d sampled colors)" % distinct.size())
 
-	# A click pushed through the panel viewport really fires a button:
-	# press the Posture button at its laid-out center and watch state flip.
-	var before: String = main.posture
-	var center: Vector2 = main.posture_btn.get_global_rect().get_center()
-	var press := InputEventMouseButton.new()
-	press.button_index = MOUSE_BUTTON_LEFT
-	press.pressed = true
-	press.position = center
-	main.panel_viewport.push_input(press)
-	var release_ev := InputEventMouseButton.new()
-	release_ev.button_index = MOUSE_BUTTON_LEFT
-	release_ev.pressed = false
-	release_ev.position = center
-	main.panel_viewport.push_input(release_ev)
-	await create_timer(0.3).timeout
-	check(main.posture != before, "panel click works end-to-end (posture %s -> %s)" % [before, main.posture])
+	# --- Fifth pass: panel aim accuracy through the PRODUCTION picking
+	# path (fake tracker pose -> RayCast3D -> _update_pointer ->
+	# SubViewport input). The old suite pushed press/release straight
+	# into the viewport at a button's rect center, never touching the
+	# hit->UV conversion, so the mirrored-u offset passed live. Here
+	# every target's world point comes from button_world_point() -
+	# anchored on the UI layout and the rendered quad, independent of
+	# the picking constants under test.
+	var l_stance := Vector3(-0.30, 1.20, -0.28)
+	var aim_targets: Array[Button] = [main.hand_btn, main.posture_btn, main.begin_btn]
+	var aim_names: Array[String] = ["left-column Hand", "center-column Posture", "right-column Begin"]
+	for ti: int in aim_targets.size():
+		var btn: Button = aim_targets[ti]
+		aim_tracker_at(&"left_hand", l_stance, button_world_point(btn))
+		await settle()
+		check(btn.is_hovered(), "beam aim hovers the %s button" % aim_names[ti])
+		for oi: int in aim_targets.size():
+			if oi != ti:
+				check(not aim_targets[oi].is_hovered(),
+					"beam aim at %s leaves %s unhovered" % [aim_names[ti], aim_names[oi]])
+
+	# Clicks through the same beam path. Posture first (harmless flip).
+	aim_tracker_at(&"left_hand", l_stance, button_world_point(main.posture_btn))
+	await settle()
+	await click_via_beam(&"left_hand")
+	check(main.posture == "SIT", "beam click on Posture toggles posture (now %s)" % main.posture)
+
+	# Then Hand: the throwing hand flips, which swaps the pointing hand.
+	aim_tracker_at(&"left_hand", l_stance, button_world_point(main.hand_btn))
+	await settle()
+	await click_via_beam(&"left_hand")
+	check(main.throwing_hand == "L", "beam click on Hand flips throwing hand (now %s)" % main.throwing_hand)
+
+	# The new off hand (R) aims and clicks Begin: enrollment starts.
+	var r_stance := Vector3(0.30, 1.20, -0.28)
+	aim_tracker_at(&"right_hand", r_stance, button_world_point(main.begin_btn))
+	await settle()
+	check(main.begin_btn.is_hovered(), "beam aim from the new off hand (R) hovers Begin")
+	await click_via_beam(&"right_hand")
+	check(main.enrolling, "beam click on Begin starts enrollment")
 
 	print("---")
 	if failures == 0:
