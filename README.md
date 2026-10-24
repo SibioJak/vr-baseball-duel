@@ -17,8 +17,11 @@ plausibly matches the number on the gun (the slow-arm/98-mph oddity fix).
 3. Start Virtual Desktop on the Quest 3 and connect to your PC (your usual
    PVLDS routine — SteamVR/OpenXR runtime live).
 4. Press F5 in Godot.
-5. You spawn on the mound. The panel floats to your left; aim your off-hand
-   controller at it and use the trigger to click.
+5. You spawn on the mound **holding a ball** in your throwing hand (orange
+   band = right controller, cyan = left). The panel floats in front of you,
+   slightly left. Point your other hand's beam at it — red while aiming,
+   green when it's on the panel, with a dot where it lands — and pull the
+   trigger to click.
 
 If OpenXR isn't live, the panel says so and you get a flat desktop camera —
 that's the failure mode, not the test.
@@ -48,10 +51,13 @@ Enrollment persists (`user://duel_profile.json`) — re-tests skip setup.
 
 ## Controls (complete list — also on the in-world panel)
 
-- **Throwing hand GRIP**: hold to hold the ball; release mid-throw to throw.
+- **Throwing hand GRIP**: squeeze to start the throw; release at your
+  release point to throw. A ball is in your hand from spawn — the squeeze
+  starts the measured throw, it doesn't summon the ball.
 - **Your arm**: the throw itself. Nothing else affects the pitch.
-- **Other hand**: aim ray at the panel; **TRIGGER** clicks buttons and drags
-  the Boost slider.
+- **Other hand**: point the beam at the panel (red = aiming, green = on the
+  panel, dot = hit point); **TRIGGER** clicks buttons and drags the Boost
+  slider. The beam flashes on a click.
 - **Quest system button (long-press)**: recenter (OS-level, not bound by the game).
 - Nothing else is bound. There is no keyboard/mouse control in the headset.
 
@@ -97,6 +103,16 @@ Headless, with the real Godot 4.7 binary:
 - `tests/smoke_main.gd` — 15 checks driving the real main scene: full
   enrollment flow, free throw classified and announced ("FASTBALL at 95 mph"),
   watch-mode curveball announced, profile save/reload/wipe. All pass.
+- `tests/render_spawn_view.gd` — renders an actual frame of the spawn view
+  (Xvfb + GL) with the rig posed as a player stands, and saves it to
+  `tests/spawn_view.png`: panel in front with legible UI text, ball in the
+  throwing hand, both controller representations visible, off-hand beam
+  landing on the panel. It also asserts the pointer ray physically hits
+  the panel's collision area and that a click pushed through the panel
+  viewport really fires a panel button. This test exists because the first
+  headset run found a panel whose UI quad sat *behind* its backing plate
+  (a dark slab, no ball, no visible hands/ray) while every logic check
+  passed.
 - Clean `--import` and a brief headless run with zero script errors (OpenXR
   loader errors on this VM are expected — it has no VR runtime).
 

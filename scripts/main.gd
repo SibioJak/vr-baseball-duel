@@ -61,7 +61,12 @@ var zone_top: float = 1.06
 var panel_root: Node3D
 var panel_viewport: SubViewport
 var panel_area: Area3D
-var pointer_ray: RayCast3D
+var ctrl_rep: Dictionary = {} # "L"/"R" -> Node3D controller representation root
+var pointer_ray_by_hand: Dictionary = {} # "L"/"R" -> RayCast3D on the aim controller
+var pointer_beam: Dictionary = {} # "L"/"R" -> MeshInstance3D visible beam
+var pointer_beam_mat: Dictionary = {} # "L"/"R" -> StandardMaterial3D
+var pointer_hit: Dictionary = {} # "L"/"R" -> MeshInstance3D hit marker
+var pointer_flash: float = 0.0
 var board_viewport: SubViewport
 var board_main: Label
 var board_sub: Label
@@ -269,14 +274,10 @@ func _build_rig() -> void:
 		a.pose = &"aim_pose"
 		origin.add_child(a)
 		aim_ctrl[hand] = a
-		var dot_mesh := SphereMesh.new()
-		dot_mesh.radius = 0.016
-		dot_mesh.height = 0.032
-		var dot := MeshInstance3D.new()
-		dot.mesh = dot_mesh
-		dot.material_override = _mat(Color(0.6, 0.65, 0.7))
-		g.add_child(dot)
-	# The ball you hold in your throwing hand.
+		_build_controller_rep(g, hand)
+		_build_pointer(a, hand)
+	# The ball you hold in your throwing hand - visible from the first frame,
+	# so the player's first sight in the scene is "I am holding a ball."
 	var ball_mesh := SphereMesh.new()
 	ball_mesh.radius = BALL_R
 	ball_mesh.height = BALL_R * 2.0
@@ -284,8 +285,101 @@ func _build_rig() -> void:
 	ball_in_hand_mesh.mesh = ball_mesh
 	ball_in_hand_mesh.material_override = _mat(Color(0.96, 0.96, 0.96))
 	ball_in_hand_mesh.position = Vector3(0.0, 0.02, -0.04)
-	ball_in_hand_mesh.visible = false
+	ball_in_hand_mesh.visible = true
 	_throw_hand_node().add_child(ball_in_hand_mesh)
+
+
+func _hand_accent(hand: String) -> Color:
+	return Color(0.25, 0.85, 1.0) if hand == "L" else Color(1.0, 0.55, 0.2)
+
+
+# A controller representation you can actually SEE: chunky body, a glowing
+# per-hand band (L cyan / R orange) and a letter tag. (The old build had a
+# 1.6 cm grey dot - effectively invisible, which is why Chris saw no hands.)
+func _build_controller_rep(ctrl: XRController3D, hand: String) -> void:
+	var rep := Node3D.new()
+	rep.name = "ControllerRep" + hand
+	ctrl.add_child(rep)
+	ctrl_rep[hand] = rep
+	var accent: Color = _hand_accent(hand)
+	var body := MeshInstance3D.new()
+	var body_mesh := BoxMesh.new()
+	body_mesh.size = Vector3(0.038, 0.026, 0.105)
+	body.mesh = body_mesh
+	body.material_override = _mat(Color(0.72, 0.74, 0.78))
+	body.position = Vector3(0.0, -0.005, 0.005)
+	body.rotation_degrees = Vector3(-18.0, 0.0, 0.0)
+	rep.add_child(body)
+	var band := MeshInstance3D.new()
+	var band_mesh := BoxMesh.new()
+	band_mesh.size = Vector3(0.040, 0.010, 0.024)
+	band.mesh = band_mesh
+	band.material_override = _mat(accent, 1.4)
+	band.position = Vector3(0.0, 0.006, -0.018)
+	band.rotation_degrees = Vector3(-18.0, 0.0, 0.0)
+	rep.add_child(band)
+	var tip := MeshInstance3D.new()
+	var tip_mesh := SphereMesh.new()
+	tip_mesh.radius = 0.011
+	tip_mesh.height = 0.022
+	tip.mesh = tip_mesh
+	tip.material_override = _mat(accent, 1.1)
+	tip.position = Vector3(0.0, 0.004, -0.048)
+	rep.add_child(tip)
+	var tag := Label3D.new()
+	tag.text = hand
+	tag.font_size = 64
+	tag.pixel_size = 0.0009
+	tag.modulate = accent
+	tag.outline_size = 8
+	tag.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	tag.position = Vector3(0.0, 0.045, 0.0)
+	rep.add_child(tag)
+
+
+# The pointer lives on BOTH aim controllers from the start (the old build
+# grew the ray lazily onto whichever hand was off-hand at first use, and a
+# RayCast3D renders nothing - so the player saw no ray at all). The beam is
+# a thin box stretched along the ray; the marker parks at the hit point.
+func _build_pointer(aim: XRController3D, hand: String) -> void:
+	var ray := RayCast3D.new()
+	ray.name = "PointerRay" + hand
+	ray.target_position = Vector3(0.0, 0.0, -4.0)
+	ray.collision_mask = 4
+	# The panel target is an Area3D, and RayCast3D ignores areas unless
+	# this is set - the shipped build never set it, so no click could
+	# ever have registered even with a visible panel.
+	ray.collide_with_areas = true
+	ray.enabled = true
+	aim.add_child(ray)
+	pointer_ray_by_hand[hand] = ray
+	var beam := MeshInstance3D.new()
+	var beam_mesh := BoxMesh.new()
+	beam_mesh.size = Vector3(0.0035, 0.0035, 1.0)
+	beam.mesh = beam_mesh
+	var bmat := StandardMaterial3D.new()
+	bmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	bmat.albedo_color = Color(1.0, 0.45, 0.4, 0.8)
+	bmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	beam.material_override = bmat
+	beam.position = Vector3(0.0, 0.0, -2.0)
+	beam.scale = Vector3(1.0, 1.0, 4.0)
+	beam.visible = false
+	aim.add_child(beam)
+	pointer_beam[hand] = beam
+	pointer_beam_mat[hand] = bmat
+	var hitm := MeshInstance3D.new()
+	var hit_mesh := SphereMesh.new()
+	hit_mesh.radius = 0.009
+	hit_mesh.height = 0.018
+	hitm.mesh = hit_mesh
+	var hmat := StandardMaterial3D.new()
+	hmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	hmat.albedo_color = Color(1.0, 0.9, 0.3)
+	hitm.material_override = hmat
+	hitm.visible = false
+	aim.add_child(hitm)
+	pointer_hit[hand] = hitm
 
 
 func _throw_hand_node() -> XRController3D:
@@ -490,15 +584,20 @@ func _build_panel() -> void:
 	controls.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	controls.add_theme_font_size_override("font_size", 18)
 	controls.add_theme_color_override("font_color", Color(0.55, 0.62, 0.72))
-	controls.text = "CONTROLS - Throwing hand GRIP: hold to hold the ball, release mid-throw to throw. Your ARM is the throw. Other hand: aim the ray at this panel, TRIGGER clicks buttons and drags the Boost slider. Quest system button (long-press): recenter. Nothing else is bound."
+	controls.text = "CONTROLS - The ball is in your throwing hand (ORANGE band = right hand, CYAN band = left). Throwing hand: squeeze GRIP, throw, let go of GRIP at your release point - your ARM is the throw. Other hand: point the beam at this panel (red = aiming, green = on the panel, dot = where it lands) and pull TRIGGER to click buttons or drag the Boost slider. Quest system button (long-press): recenter. Nothing else is bound."
 	vbox.add_child(controls)
 
 	panel_root = Node3D.new()
 	add_child(panel_root)
 	_box(panel_root, Vector3.ZERO, Vector3(PANEL_M.x + 0.06, PANEL_M.y + 0.06, 0.04), _mat(Color(0.06, 0.07, 0.1)))
 	var quad := _viewport_quad(panel_viewport, PANEL_M)
-	quad.rotation.y = PI # quad front (+Z) must face the player; root look_at aims -Z at them
-	quad.position = Vector3(0.0, 0.0, 0.03)
+	# The root's -Z faces the player (look_at), so the PLAYER side of the
+	# backing plate is local -Z: the quad must sit at z = -0.03 with its
+	# front turned toward the player (rotation.y = PI). The shipped build
+	# had +0.03 - the plate (z -0.02..+0.02) hid the UI completely and all
+	# Chris saw was a giant dark slab.
+	quad.rotation.y = PI
+	quad.position = Vector3(0.0, 0.0, -0.03)
 	panel_root.add_child(quad)
 	panel_area = Area3D.new()
 	panel_area.collision_layer = 4
@@ -513,11 +612,17 @@ func _build_panel() -> void:
 
 
 func _place_panel() -> void:
+	# In front of the player at readable distance (~1.6 m), slightly left of
+	# center so it never blocks the lane to the plate. The shipped build
+	# parked it far left at (-1.08, 1.34, -1.3) - out of the natural view.
+	var target: Vector3
 	if mode == Mode.WATCH:
-		panel_root.position = Vector3(-0.55, 1.32, PLATE_POS.z + 1.7)
+		panel_root.position = Vector3(-0.7, 1.35, PLATE_POS.z + 1.9)
+		target = Vector3(0.9, 1.35, PLATE_POS.z + 0.45) # the player's head at the box
 	else:
-		panel_root.position = Vector3(-1.08, 1.34, -1.3)
-	panel_root.look_at(Vector3(panel_root.position.x * 0.2, 1.35, 0.0 if mode != Mode.WATCH else PLATE_POS.z), Vector3.UP)
+		panel_root.position = Vector3(-0.48, 1.32, -1.5)
+		target = Vector3(0.0, 1.32, 0.0) # the player on the mound
+	panel_root.look_at(target, Vector3.UP)
 
 
 func _show_on_board(main_text: String, sub_text: String) -> void:
@@ -539,6 +644,8 @@ func _set_mode(new_mode: int) -> void:
 		origin.rotation = Vector3.ZERO
 	if ai_mannequin != null:
 		ai_mannequin.visible = mode == Mode.WATCH
+	if ball_in_hand_mesh != null:
+		ball_in_hand_mesh.visible = mode != Mode.WATCH
 	_place_panel()
 	_refresh_ui()
 
@@ -660,6 +767,8 @@ func _start_enrollment(steps: Array) -> void:
 	mode = Mode.SETUP
 	origin.position = Vector3.ZERO
 	origin.rotation = Vector3.ZERO
+	if ball_in_hand_mesh != null:
+		ball_in_hand_mesh.visible = true
 	if ai_mannequin != null:
 		ai_mannequin.visible = false
 	enroll_queue = steps.duplicate()
@@ -722,8 +831,13 @@ func _recompute_separation() -> void:
 
 # ---------------------------------------------------------------- sampling + throwing
 
-func _physics_process(_delta: float) -> void:
-	_update_pointer()
+func _physics_process(delta: float) -> void:
+	_update_pointer(delta)
+	# Controller representations show whenever their controller is tracked.
+	for h: String in ["L", "R"]:
+		var rep: Node3D = ctrl_rep[h]
+		var gc: XRController3D = grip_ctrl[h]
+		rep.visible = gc.get_is_active()
 	if mode == Mode.WATCH:
 		holding = false
 		ball_in_hand_mesh.visible = false
@@ -760,7 +874,9 @@ func _physics_process(_delta: float) -> void:
 			ring.pop_front()
 	if holding and prev_grip > 0.3 and grip <= 0.3:
 		holding = false
-		ball_in_hand_mesh.visible = false
+		# The thrown ball flies as its own node; a fresh ball is in your
+		# hand immediately, so the hand never reads as empty at rest.
+		ball_in_hand_mesh.visible = true
 		_finalize_throw()
 	prev_grip = grip
 
@@ -1263,18 +1379,33 @@ func _motion_from_rows(rows: Array) -> Array:
 
 # ---------------------------------------------------------------- panel pointer + audio
 
-func _update_pointer() -> void:
-	if pointer_ray == null:
-		# Build the ray once the off-hand aim node exists (created in _build_rig).
-		var off: XRController3D = _off_hand_node()
-		pointer_ray = RayCast3D.new()
-		pointer_ray.target_position = Vector3(0.0, 0.0, -4.0)
-		pointer_ray.collision_mask = 4
-		pointer_ray.enabled = true
-		off.add_child(pointer_ray)
-	var trig: float = _input_float(_off_hand_node(), &"trigger")
-	if pointer_ray.is_colliding() and pointer_ray.get_collider() == panel_area:
-		var hit: Vector3 = pointer_ray.get_collision_point()
+func _off_hand() -> String:
+	return "L" if throwing_hand == "R" else "R"
+
+
+func _update_pointer(delta: float) -> void:
+	var off_hand: String = _off_hand()
+	var off_aim: XRController3D = aim_ctrl[off_hand]
+	var ray: RayCast3D = pointer_ray_by_hand[off_hand]
+	var beam: MeshInstance3D = pointer_beam[off_hand]
+	var beam_mat: StandardMaterial3D = pointer_beam_mat[off_hand]
+	var hitm: MeshInstance3D = pointer_hit[off_hand]
+	# Only the off hand points at the panel; the throwing hand's beam is stowed.
+	for h: String in ["L", "R"]:
+		if h != off_hand:
+			var other_beam: MeshInstance3D = pointer_beam[h]
+			var other_hit: MeshInstance3D = pointer_hit[h]
+			other_beam.visible = false
+			other_hit.visible = false
+	var active: bool = off_aim.get_is_active()
+	var hovering: bool = false
+	var ray_len: float = 4.0
+	var trig: float = _input_float(off_aim, &"trigger")
+	if active and ray.is_colliding() and ray.get_collider() == panel_area:
+		hovering = true
+		var hit: Vector3 = ray.get_collision_point()
+		ray_len = off_aim.global_position.distance_to(hit)
+		hitm.position = off_aim.to_local(hit)
 		var local: Vector3 = panel_root.global_transform.affine_inverse() * hit
 		var u: float = clampf(local.x / PANEL_M.x + 0.5, 0.0, 1.0)
 		var v: float = clampf(0.5 - local.y / PANEL_M.y, 0.0, 1.0)
@@ -1284,6 +1415,7 @@ func _update_pointer() -> void:
 		panel_viewport.push_input(motion_ev)
 		if trig > 0.75 and not pointer_down:
 			pointer_down = true
+			pointer_flash = 0.15
 			var press := InputEventMouseButton.new()
 			press.button_index = MOUSE_BUTTON_LEFT
 			press.pressed = true
@@ -1298,6 +1430,24 @@ func _update_pointer() -> void:
 			panel_viewport.push_input(release_ev)
 	elif pointer_down:
 		pointer_down = false
+	# Beam visuals: length to the hit (or full reach), red while aiming,
+	# green on the panel, fat pale flash the moment a click lands.
+	beam.visible = active
+	hitm.visible = hovering
+	beam.scale.z = ray_len
+	beam.position.z = -ray_len * 0.5
+	if pointer_flash > 0.0:
+		pointer_flash = maxf(0.0, pointer_flash - delta)
+		beam.scale.x = 2.4
+		beam.scale.y = 2.4
+		beam_mat.albedo_color = Color(1.0, 1.0, 0.65, 0.95)
+	else:
+		beam.scale.x = 1.0
+		beam.scale.y = 1.0
+		if hovering:
+			beam_mat.albedo_color = Color(0.45, 1.0, 0.55, 0.9)
+		else:
+			beam_mat.albedo_color = Color(1.0, 0.45, 0.4, 0.8)
 
 
 func _make_blip(freq: float, seconds: float, volume: float) -> AudioStreamWAV:
