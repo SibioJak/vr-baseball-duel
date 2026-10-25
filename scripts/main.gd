@@ -99,6 +99,7 @@ var gaze_correction: Quaternion = Quaternion.IDENTITY
 var gaze_calibrated: bool = false
 var gaze_offset_deg: float = 0.0 # largest single-target offset at calibration
 var gaze_fit_error_deg: float = -1.0
+var gaze_dropped_count: int = 0 # captures the robust fit left out (twelfth pass)
 # Gaze step runtime: targets light one at a time on the zone frame;
 # a target captures by DWELL - head forward stable (< GAZE_STABLE_DEG
 # max deviation over a rolling GAZE_DWELL_S window). Chris's measured
@@ -976,6 +977,7 @@ func _on_wipe() -> void:
 	gaze_calibrated = false
 	gaze_offset_deg = 0.0
 	gaze_fit_error_deg = -1.0
+	gaze_dropped_count = 0
 	separation_note = ""
 	last_result = "Profile erased. Enroll again when ready."
 	_play_click()
@@ -1390,6 +1392,12 @@ func _record_throw_attempt(samples: Array, features: PackedFloat32Array, speed: 
 		"calib_max": calib_max, "pending_calib_max": pending_calib_max,
 		"fast_anchor": fast_anchor,
 		"med_anchor": med_anchor, "boost_mult": boost_mult,
+		# Twelfth pass: the fitted gaze correction rides in every
+		# record, so a future field miss decomposes from the log
+		# alone (session 3's miss could not - it was never recorded).
+		"gaze_correction_quat": [gaze_correction.x, gaze_correction.y, gaze_correction.z, gaze_correction.w],
+		"gaze_offset_deg": snappedf(gaze_offset_deg, 0.01),
+		"gaze_fit_residual_deg": snappedf(gaze_fit_error_deg, 0.01),
 		"templates": _templates_snapshot(),
 	}
 	_append_throw_record(rec)
@@ -1983,11 +1991,23 @@ func _finish_gaze() -> void:
 		gaze_calibrated = true
 		gaze_offset_deg = float(fit["max_delta_deg"])
 		gaze_fit_error_deg = float(fit["fit_error_deg"])
+		gaze_dropped_count = int(fit.get("dropped", 0))
+		var drop_note: String = ""
+		if gaze_dropped_count > 0:
+			drop_note = " %d look(s) did not match the others and were left out." % gaze_dropped_count
 		if gaze_offset_deg > 12.0:
-			last_result = "Gaze calibrated - a LARGE gaze offset was measured (%.0f deg) and the correction is applied. Your look now aims the pitch (fit error %.1f deg)." % [gaze_offset_deg, gaze_fit_error_deg]
+			last_result = "Gaze calibrated - a LARGE gaze offset was measured (%.0f deg) and the correction is applied.%s Your look now aims the pitch (fit error %.1f deg)." % [gaze_offset_deg, drop_note, gaze_fit_error_deg]
 		else:
-			last_result = "Gaze calibrated (offset %.0f deg, fit error %.1f deg). Your look now aims the pitch." % [gaze_offset_deg, gaze_fit_error_deg]
+			last_result = "Gaze calibrated (offset %.0f deg, fit error %.1f deg).%s Your look now aims the pitch." % [gaze_offset_deg, gaze_fit_error_deg, drop_note]
 		_save_profile()
+	else:
+		# The robust fit refused: the captured looks never agreed with
+		# each other, so there is no honest correction. Keep any
+		# previous calibration (do NOT overwrite the profile) and say
+		# so, instead of certifying a correction averaged out of
+		# mismatched looks (the session-3 failure: applied anyway).
+		gaze_dropped_count = int(fit.get("dropped", 0))
+		last_result = "Gaze step did NOT take - your looks did not agree with each other, so no correction was applied. Press Re-gaze and look at each lit target until it turns green."
 	_update_gaze_markers()
 	_advance_step()
 

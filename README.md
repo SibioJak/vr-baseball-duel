@@ -36,7 +36,12 @@ that's the failure mode, not the test.
      when your head is still (no buttons). From the five looks the game
      fits the fixed rotation between the headset's forward and *your*
      eye line, and every later pitch aims with the corrected line.
-     **Re-gaze** (in the re-enroll row) re-runs just this step.
+     The fit is robust (twelfth pass): a look that doesn't match the
+     others — say the first dwell fires while you're still reading
+     this panel — is left out and the panel says so; if the looks
+     never agree, the step refuses rather than applying a bad
+     correction. **Re-gaze** (in the re-enroll row) re-runs just
+     this step.
    - 3 hardest *comfortable* fastballs (calibration — your 100% becomes 96 mph),
    - 3 fastball motions,
    - 3 FAST fastballs and 3 MEDIUM fastballs (your velocity gears — each
@@ -161,7 +166,7 @@ sound beyond two tiny UI blips (no loops — nothing can play after close).
 
 Headless, with the real Godot 4.7 binary:
 
-- `tests/run_tests.gd` — 64 checks on the pure logic: classifier separates
+- `tests/run_tests.gd` — 68 checks on the pure logic: classifier separates
   synthetic FB/CB and rejects a mushy pair, velocity mapping/gears, warp
   bounds and delivery compression, flight times, curveball crosses 0.82 m
   below a same-speed fastball, profile round-trip. The seventh-pass
@@ -209,6 +214,22 @@ Headless, with the real Godot 4.7 binary:
   records null aim fields), and the v2→v3 profile upgrade (templates
   SURVIVE — no vector changed — gaze loads uncalibrated with a Re-gaze
   suggestion; scatter round-trips). All pass.
+- `tests/gaze_field_path.gd` — 27 checks (twelfth pass): the gaze
+  pipeline end to end through the REAL field path — real dwell
+  captures on a synthetic biased head, profile save, fresh load, real
+  `_compute_aim`. Phase 3 is the session-3 reproduction: one capture
+  taken looking at the PANEL (the step starts the instant Re-gaze is
+  pressed there) among four honest ones. On the pre-fix plain-mean
+  fit it landed the corrected target 1.96 m off zone center; the
+  robust fit (medoid consensus, mismatched captures dropped, refusal
+  when fewer than 3 agree) drops the bad look and lands at 0.00 m.
+  Phase 4 pins the recorder diagnostics: every throw record's state
+  snapshot now carries `gaze_correction_quat`, `gaze_offset_deg` and
+  `gaze_fit_residual_deg`, so a field miss decomposes from the log
+  alone. Session 3's field miss is what this pass fixed: the applied
+  correction was a constant rotation +1.45 m right of the raw look —
+  a fit poisoned by a mismatched capture, certified without ever
+  checking that the captures agreed with each other.
 - `tests/render_spawn_view.gd` — 44 checks: renders an actual frame of
   the spawn view (Xvfb + GL) with the rig posed as a player stands, and
   saves it to `tests/spawn_view.png`: panel in front with legible UI

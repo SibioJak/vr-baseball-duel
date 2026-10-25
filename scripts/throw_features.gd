@@ -617,6 +617,14 @@ static func aim_cross(target: Vector3, intent_cross: Vector3, k: float) -> Vecto
 	return target + (intent_cross - target) * k
 
 
+## Inlier bound for the robust gaze fit: captures of ONE rigid bias
+## agree with each other to ~a degree (head stability measured 0.2 deg
+## mean in the field), while a capture taken looking somewhere else
+## sits tens of degrees away. 3 deg is far above honest scatter and
+## far below a wrong look.
+const GAZE_FIT_INLIER_DEG: float = 3.0
+
+
 ## Fit ONE gaze correction from dwell captures. Each capture pairs the
 ## head ray the player actually wore while looking at a known target:
 ##   {"head_pos": Vector3, "head_fwd": Vector3, "target": Vector3}
@@ -628,23 +636,32 @@ static func aim_cross(target: Vector3, intent_cross: Vector3, k: float) -> Vecto
 ## player's eye line differ by a fixed rotation of the head, not by a
 ## translation at one distance - and a single rigid bias (the synthetic
 ## test case, and approximately Chris's measured +5/+4 deg) fits to
-## ~zero residual. Returns the correction, the mean angular residual
-## AFTER fitting (fit_error_deg), the mean raw error, the largest
-## single-capture delta (max_delta_deg - the sanity bound main.gd
-## reports when it exceeds 12 deg), and the capture count.
+## ~zero residual.
+##
+## ROBUST (twelfth pass): the dwell certifies any STILL head - there
+## is deliberately no proximity gate - so a capture can pair a target
+## with a look that was never at it (the classic case: the step starts
+## the instant Re-gaze is pressed ON THE PANEL, and the first dwell
+## fires while the player is still reading the prompt). A plain mean
+## let one such capture drag the correction ~35 deg off; Chris's
+## session 3 wore a correction rotated 4.5 deg the WRONG way and
+## every pitch landed ~1.4 m right of his raw look. The fit is now
+## two-stage: the consensus is the MEDOID delta (the one closest to
+## all the others), captures further than GAZE_FIT_INLIER_DEG from it
+## are DROPPED, and the average is taken over the survivors. If fewer
+## than 3 captures agree, the fit REFUSES (count 0) - the looks never
+## agreed, so there is no honest correction to apply. Returns the
+## correction, the mean angular residual AFTER fitting over the used
+## captures (fit_error_deg), the mean raw error over the used
+## captures, the largest used single-capture delta (max_delta_deg -
+## the sanity bound main.gd reports when it exceeds 12 deg), how many
+## captures were used (count) and how many were dropped (dropped).
 static func gaze_correction_fit(captures: Array) -> Dictionary:
 	var out: Dictionary = {
 		"correction": Quaternion.IDENTITY, "fit_error_deg": -1.0,
 		"raw_error_deg": -1.0, "max_delta_deg": 0.0, "count": 0,
+		"dropped": 0,
 	}
-	var sx: float = 0.0
-	var sy: float = 0.0
-	var sz: float = 0.0
-	var sw: float = 0.0
-	var have_ref: bool = false
-	var ref_q := Quaternion.IDENTITY
-	var raw_sum: float = 0.0
-	var max_delta: float = 0.0
 	var deltas: Array = []
 	var pairs: Array = []
 	for raw: Variant in captures:
@@ -664,10 +681,40 @@ static func gaze_correction_fit(captures: Array) -> Dictionary:
 			continue
 		desired = desired.normalized()
 		var fwd: Vector3 = hf.normalized()
-		var delta := Quaternion(fwd, desired)
-		if not have_ref:
-			ref_q = delta
-			have_ref = true
+		deltas.append(Quaternion(fwd, desired))
+		pairs.append([fwd, desired])
+	var n: int = deltas.size()
+	if n == 0:
+		return out
+	# Consensus: the medoid delta.
+	var medoid: int = 0
+	var best_total: float = INF
+	for i: int in n:
+		var qi: Quaternion = deltas[i]
+		var tot: float = 0.0
+		for j: int in n:
+			if i != j:
+				tot += rad_to_deg(qi.angle_to(deltas[j]))
+		if tot < best_total:
+			best_total = tot
+			medoid = i
+	var ref_q: Quaternion = deltas[medoid]
+	var used: Array = []
+	for i2: int in n:
+		if rad_to_deg(ref_q.angle_to(deltas[i2])) <= GAZE_FIT_INLIER_DEG:
+			used.append(i2)
+	out["dropped"] = n - used.size()
+	if used.size() < mini(3, n):
+		return out
+	var sx: float = 0.0
+	var sy: float = 0.0
+	var sz: float = 0.0
+	var sw: float = 0.0
+	var raw_sum: float = 0.0
+	var max_delta: float = 0.0
+	for iu: Variant in used:
+		var idx: int = iu
+		var delta: Quaternion = deltas[idx]
 		var dot: float = delta.x * ref_q.x + delta.y * ref_q.y + delta.z * ref_q.z + delta.w * ref_q.w
 		if dot < 0.0:
 			delta = Quaternion(-delta.x, -delta.y, -delta.z, -delta.w)
@@ -675,29 +722,24 @@ static func gaze_correction_fit(captures: Array) -> Dictionary:
 		sy += delta.y
 		sz += delta.z
 		sw += delta.w
-		deltas.append(delta)
-		pairs.append([fwd, desired])
-		raw_sum += rad_to_deg(fwd.angle_to(desired))
-		max_delta = maxf(max_delta, rad_to_deg(fwd.angle_to(desired)))
-	var n: int = pairs.size()
-	if n == 0:
-		return out
+		var pr: Array = pairs[idx]
+		var ang: float = rad_to_deg((pr[0] as Vector3).angle_to(pr[1] as Vector3))
+		raw_sum += ang
+		max_delta = maxf(max_delta, ang)
 	var correction := Quaternion(sx, sy, sz, sw)
 	if correction.length() < 0.0001:
 		correction = Quaternion.IDENTITY
 	else:
 		correction = correction.normalized()
 	var fit_sum: float = 0.0
-	for raw2: Variant in pairs:
-		var pr: Array = raw2
-		var f2: Vector3 = pr[0]
-		var d2: Vector3 = pr[1]
-		fit_sum += rad_to_deg((correction * f2).angle_to(d2))
+	for iu2: Variant in used:
+		var pr2: Array = pairs[iu2]
+		fit_sum += rad_to_deg((correction * (pr2[0] as Vector3)).angle_to(pr2[1] as Vector3))
 	out["correction"] = correction
-	out["fit_error_deg"] = fit_sum / float(n)
-	out["raw_error_deg"] = raw_sum / float(n)
+	out["fit_error_deg"] = fit_sum / float(used.size())
+	out["raw_error_deg"] = raw_sum / float(used.size())
 	out["max_delta_deg"] = max_delta
-	out["count"] = n
+	out["count"] = used.size()
 	return out
 
 

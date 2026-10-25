@@ -353,6 +353,30 @@ func _init() -> void:
 	var center_pt: Vector3 = center_cross["cross"]
 	check(Vector2(center_pt.x, center_pt.y).distance_to(Vector2(0.0, 0.77)) < 0.15,
 		"corrected center look lands within 0.15 m of zone center (%.2f, %.2f)" % [center_pt.x, center_pt.y])
+	# Robust fit (twelfth pass): ONE capture taken looking somewhere
+	# else entirely (at the panel, ~40 deg off) must be DROPPED, not
+	# averaged in - session 3's plain mean applied a correction
+	# rotated the wrong way and every pitch went ~1.4 m right.
+	var poisoned: Array = captures.duplicate()
+	poisoned[0] = {"head_pos": gaze_head, "head_fwd": (bias_q * (Vector3(-1.0, 1.32, -1.50) - gaze_head).normalized()).normalized(), "target": gaze_targets_fit[0]}
+	var pfit: Dictionary = ThrowFeatures.gaze_correction_fit(poisoned)
+	check(int(pfit["count"]) == 4 and int(pfit["dropped"]) == 1,
+		"robust fit drops the one mismatched capture (used %d, dropped %d)" % [int(pfit["count"]), int(pfit["dropped"])])
+	check(float(pfit["fit_error_deg"]) < 0.5, "robust fit residual stays ~zero after the drop (%.3f deg)" % float(pfit["fit_error_deg"]))
+	var pcorr: Quaternion = pfit["correction"]
+	var pcenter: Dictionary = ThrowFeatures.plate_cross(gaze_head, pcorr * (bias_q * center_desired))
+	var ppt: Vector3 = pcenter["cross"]
+	check(Vector2(ppt.x, ppt.y).distance_to(Vector2(0.0, 0.77)) < 0.15,
+		"robust fit still lands a center look within 0.15 m (%.2f, %.2f)" % [ppt.x, ppt.y])
+	# And when the looks never agree at all, the fit must REFUSE
+	# (count 0) rather than certify an average of mismatched looks.
+	var chaos: Array = []
+	for ci: int in 5:
+		var wild_q: Quaternion = Quaternion.from_euler(Vector3(deg_to_rad(float(ci * 17 - 30)), deg_to_rad(float(ci * 29 - 55)), 0.0))
+		var gt2: Vector3 = gaze_targets_fit[ci]
+		chaos.append({"head_pos": gaze_head, "head_fwd": wild_q * (gt2 - gaze_head).normalized(), "target": gt2})
+	var cfit: Dictionary = ThrowFeatures.gaze_correction_fit(chaos)
+	check(int(cfit["count"]) == 0, "robust fit refuses when fewer than 3 captures agree (used %d)" % int(cfit["count"]))
 	# Drop-compensated solve: the SIMULATED ball must cross within
 	# ~0.1 m of the aim point at a pro fastball and at a changeup pace.
 	var aim_start := Vector3(0.25, 1.80, -0.60)
