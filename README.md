@@ -31,26 +31,30 @@ that's the failure mode, not the test.
 1. Pick throwing hand + posture (sitting or standing) on the panel.
 2. **Begin enrollment.** Follow the prompts, one throw at a time:
    - 3 hardest *comfortable* fastballs (calibration — your 100% becomes 96 mph),
-   - 3 fastball motions, 3 curveball motions, an optional third pitch (skippable),
+   - 3 fastball motions,
    - 2 FAST fastballs and 2 MEDIUM fastballs (your velocity gears).
    A throw = hold **grip** to hold the ball, make your motion, **release grip**
    at your release point. The ball flies where your *arm* was throwing —
    direction is read from the peak-speed window of the delivery, not from
    the frame where the grip happened to let go.
-   - **The curveball step is different now:** before you throw, pick a
-     *picture* — **Turn the doorknob**, **Pull the shade down**, or
-     **Karate chop** — and a translucent ghost arm in front of you demos
-     that motion on a loop. Throw your version of the picture. The game
-     reads the *twist itself* (forearm roll is a first-class classifier
-     feature), so a curveball that's just a slower fastball will be
-     called out by name: the separation warning will tell you the twist
-     isn't reading.
-3. If your fastball and curveball motions read too similar, the panel warns
-   you in plain words and offers re-enroll buttons. It never silently accepts
-   a mushy pair.
-4. **Free throw** on the mound: every throw is classified (type + confidence),
-   geared (FAST/MEDIUM), flown with movement from *your* wrist action, and
-   posted on the gun board with its strike/ball call and your PBs.
+   - **Fastball only, for now (ninth pass):** enrollment is the fastball
+     and its gears, and free throw treats every throw as a fastball — the
+     classifier isn't consulted until a curveball exists. The curveball
+     machinery is built and parked, not removed: **Re-enroll CB** still
+     runs its step, which is different when you get there — before you
+     throw, pick a *picture* — **Turn the doorknob**, **Pull the shade
+     down**, or **Karate chop** — and a translucent ghost arm in front of
+     you demos that motion on a loop. The game reads the *twist itself*
+     (forearm roll is a first-class classifier feature), so a curveball
+     that's just a slower fastball gets called out by name: the
+     separation warning will tell you the twist isn't reading.
+3. Once a curveball is enrolled alongside the fastball, if the two motions
+   read too similar the panel warns you in plain words and offers re-enroll
+   buttons. It never silently accepts a mushy pair.
+4. **Free throw** on the mound: with only a fastball enrolled, every throw
+   is a fastball — geared (FAST/MEDIUM), flown, and posted on the gun board
+   with its strike/ball call and your PBs. With a curveball enrolled too,
+   each throw is classified (type + confidence) as before.
 5. **Go to BOX (watch)**: pick FB / CB / MIX, press THROW IT. The AI arm
    replays *your enrolled motion*, retimed (delivery phase time-warped,
    bounded 1.0–3.0x) so visible arm speed matches the pitch's game velocity.
@@ -72,6 +76,11 @@ Enrollment persists (`user://duel_profile.json`) — re-tests skip setup.
 - Nothing else is bound. There is no keyboard/mouse control in the headset.
 
 ## What you're judging (the three verdict surfaces)
+
+**Current scope (ninth pass): fastball only.** The live surfaces are #2 and
+the fastball half of #3 — the gun's honesty on fastballs (velocity, gears,
+flight, aim) from a full pitching motion. Surface #1 and the curveball come
+back when a curveball is enrolled.
 
 1. **Classifier separation** — does it tell your fastball from your curveball
    at game speed, and does the confidence % look honest (including on a

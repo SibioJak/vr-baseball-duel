@@ -108,6 +108,71 @@ func _run() -> void:
 	check(not main.ghost_root.visible, "ghost arm hides when the CB step ends")
 	check(not main.cue_row.visible, "cue picker hides when the CB step ends")
 
+	# FB-only default flow (ninth pass, Chris: fastball only until it
+	# works). Begin enrollment runs calib/fb/gears - no CB, no third
+	# pitch - and the gun goes live on fastballs alone: full flight,
+	# announcement, PBs, WITHOUT the classifier. The recorder flags
+	# these verdicts fb_only so they are never read as classifications.
+	main._on_wipe()
+	main._on_begin()
+	check(main.enroll_queue.size() == 4 and String(main.enroll_queue[0]) == "calib"
+		and String(main.enroll_queue[1]) == "fb"
+		and not main.enroll_queue.has("cb") and not main.enroll_queue.has("p3"),
+		"default enrollment is fastball-only (calib, fb, gears)")
+	feed(main, false, 8.0, 3) # calib
+	feed(main, false, 8.1, 3) # fb
+	feed(main, false, 8.05, 2) # gear fast
+	feed(main, false, 6.9, 2) # gear medium
+	check(not main.enrolling, "FB-only enrollment completed")
+	check(main.templates.has("FB") and not main.templates.has("CB"),
+		"FB enrolled, CB not (FB-only state)")
+	check(main.mode == 1, "FB-only enrollment lands in FREE_THROW (mode=%d)" % main.mode)
+	check(main.last_result.contains("live on fastballs"),
+		"finish text says the gun is live on fastballs (%s)" % main.last_result)
+	check(main.separation_note == "", "no separation warning in FB-only state")
+	check(main.prompt_label.text.contains("live on fastballs"),
+		"free-throw prompt says the gun is live on fastballs")
+	var fbo_motion: Array = make_motion(7.9, false)
+	var fbo_feats: PackedFloat32Array = ThrowFeatures.extract_features(fbo_motion)
+	var fbo_before: int = main.flights.size()
+	var fbo_v: Variant = main._free_throw(fbo_feats, 7.9, fbo_motion)
+	var fbo: Dictionary = fbo_v if fbo_v is Dictionary else {}
+	check(bool(fbo.get("fb_only", false)) and not bool(fbo.get("classified", true)),
+		"FB-only free throw is FB by mode, not classified")
+	check(main.flights.size() == fbo_before + 1, "FB-only free throw produced a flight")
+	await create_timer(1.6).timeout
+	check(main.last_result.begins_with("Gun:") and main.last_result.contains("FASTBALL"),
+		"gun announced the FB-only pitch (%s)" % main.last_result)
+	check(not main.board_sub.text.contains("sure"),
+		"gun board shows no confidence for an FB-only throw (%s)" % main.board_sub.text)
+	check(main.pbs.has("FB"), "FB-only throw recorded a personal best")
+	# Recorder: the FB-only verdict lands flagged, via _finalize_throw.
+	main._on_clear_throw_log()
+	main.ring = make_motion(7.9, false).duplicate()
+	main._finalize_throw()
+	check(main.throws_recorded == 1, "fb-only recorder: throw appended")
+	var fbo_lines: Array = FileAccess.get_file_as_string("user://throws.jsonl").split("\n", false)
+	var fbo_parsed: Variant = JSON.parse_string(fbo_lines[0]) if fbo_lines.size() == 1 else null
+	if fbo_parsed is Dictionary:
+		var fbo_rec: Dictionary = fbo_parsed
+		var fbo_verdict: Variant = fbo_rec.get("verdict")
+		check(fbo_verdict is Dictionary and bool((fbo_verdict as Dictionary).get("fb_only", false)),
+			"fb-only recorder: verdict flagged fb_only")
+		check(fbo_verdict is Dictionary and String((fbo_verdict as Dictionary).get("pitch", "")) == "FB"
+			and (fbo_verdict as Dictionary).get("confidence") == null,
+			"fb-only recorder: pitch FB, confidence null (no classifier ran)")
+		check(String(fbo_rec.get("mode", "")) == "free", "fb-only recorder: mode reads free")
+	else:
+		check(false, "fb-only recorder: record parses as JSON")
+	main._on_clear_throw_log()
+	# The parked CB machinery still works after all that: Re-enroll CB
+	# reaches the cue step and completes.
+	main._start_enrollment(["cb"])
+	check(main.cue_row.visible and main.ghost_root.visible,
+		"Re-enroll CB still reaches the cue step after the FB-only flow")
+	feed(main, true, 6.3, 3)
+	check(main.templates.has("CB"), "CB enrolls on demand (machinery intact, parked)")
+
 	# Enrollment, driven exactly as grip throws would drive it.
 	main._start_enrollment(["calib", "fb", "cb", "p3", "gear_fast", "gear_med"])
 	feed(main, false, 8.0, 3) # calib

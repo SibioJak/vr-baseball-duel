@@ -703,15 +703,22 @@ func _build_panel() -> void:
 
 
 func _place_panel() -> void:
-	# In front of the player at readable distance (~1.6 m), slightly left of
-	# center so it never blocks the lane to the plate. The shipped build
-	# parked it far left at (-1.08, 1.34, -1.3) - out of the natural view.
+	# Left of the mound->plate sight line, at readable distance, facing the
+	# player squarely (look_at) so every button stays reachable by the
+	# beam. Ninth pass (Chris, in the headset): the previous mound spot
+	# (-0.48, 1.32, -1.5) still hung in the throw line - its right edge
+	# crossed the lane. Now a further 0.52 m left at (-1.00, 1.32, -1.50),
+	# ~1.80 m out: from the mound the panel spans roughly 15-52 degrees
+	# left of the lane, so plate, zone frame, and gun board read clear.
+	# Picking maps through the quad's own transform, so the move needs no
+	# picking change - the render suite's anchored aim checks re-derive
+	# their targets from the moved quad's geometry.
 	var target: Vector3
 	if mode == Mode.WATCH:
 		panel_root.position = Vector3(-0.7, 1.35, PLATE_POS.z + 1.9)
 		target = Vector3(0.9, 1.35, PLATE_POS.z + 0.45) # the player's head at the box
 	else:
-		panel_root.position = Vector3(-0.48, 1.32, -1.5)
+		panel_root.position = Vector3(-1.0, 1.32, -1.5)
 		target = Vector3(0.0, 1.32, 0.0) # the player on the mound
 	panel_root.look_at(target, Vector3.UP)
 
@@ -764,7 +771,7 @@ func _refresh_ui() -> void:
 		var cue_b: Button = cue_btns[cue_key]
 		var cue_d: Dictionary = CB_CUES[cue_key]
 		cue_b.text = ("> " if cue_key == cb_cue else "") + String(cue_d["label"])
-	var enrolled: bool = templates.has("FB") and templates.has("CB")
+	var enrolled: bool = not templates.is_empty()
 	var status: String = ""
 	if not xr_ok:
 		status += "OpenXR NOT initialized - run from the Godot editor with your VR runtime live. "
@@ -810,8 +817,10 @@ func _current_prompt() -> String:
 	if mode == Mode.WATCH:
 		return "FROM THE BOX - See: %s. Press THROW IT and watch it come in. The arm you see replays YOUR enrolled motion, retimed so its speed matches the number." % watch_selection
 	if templates.has("FB"):
-		return "FREE THROW - Grip, throw, release. The gun reads every pitch: type, confidence, velocity."
-	return "Pick your throwing hand and posture, then press Begin enrollment. Your arm teaches the game your pitches."
+		if templates.has("CB"):
+			return "FREE THROW - Grip, throw, release. The gun reads every pitch: type, confidence, velocity."
+		return "FREE THROW - Grip, throw, release. The gun is live on fastballs: velocity, gear, call."
+	return "Pick your throwing hand and posture, then press Begin enrollment. Your arm teaches the game your fastball."
 
 
 # ---------------------------------------------------------------- enrollment control
@@ -852,7 +861,11 @@ func _on_boost_changed(value: float) -> void:
 
 func _on_begin() -> void:
 	_play_click()
-	_start_enrollment(["calib", "fb", "cb", "p3", "gear_fast", "gear_med"])
+	# Ninth pass (Chris): fastball only until it works. The default flow
+	# teaches calibration, the fastball, and the velocity gears - the CB
+	# and third-pitch steps stay built and reachable via Re-enroll, they
+	# are just not on the default path anymore.
+	_start_enrollment(["calib", "fb", "gear_fast", "gear_med"])
 
 
 func _on_skip() -> void:
@@ -922,11 +935,14 @@ func _advance_step() -> void:
 func _finish_enrollment() -> void:
 	_recompute_separation()
 	_save_profile()
-	if templates.has("FB") and templates.has("CB"):
+	if templates.has("FB"):
 		mode = Mode.FREE_THROW
-		last_result = "Enrollment complete. Free throw - the gun is live."
+		if templates.has("CB"):
+			last_result = "Enrollment complete. Free throw - the gun is live."
+		else:
+			last_result = "Enrollment complete. Free throw - the gun is live on fastballs."
 	else:
-		last_result = "Enrollment finished. (Fastball + curveball both enrolled = free throw unlocks.)"
+		last_result = "Enrollment finished. (Enroll a fastball to unlock free throw.)"
 
 
 func _recompute_separation() -> void:
@@ -1015,7 +1031,7 @@ func _finalize_throw() -> void:
 	# Mode/step are captured BEFORE dispatch: a throw that completes
 	# enrollment flips `enrolling` off, and the record must say what the
 	# throw WAS, not what the state became.
-	var rec_mode: String = "enroll" if enrolling else ("free" if templates.has("FB") and templates.has("CB") else "pre_enrollment")
+	var rec_mode: String = "enroll" if enrolling else ("free" if templates.has("FB") else "pre_enrollment")
 	var rec_step: String = ""
 	if enrolling and enroll_idx < enroll_queue.size():
 		rec_step = String(enroll_queue[enroll_idx])
@@ -1078,19 +1094,29 @@ func _finalize_throw() -> void:
 		var fo: Dictionary = _free_throw(features, speed, samples)
 		var f_meta: Dictionary = fo["flight_meta"]
 		detail["flight"] = _flight_record(f_meta)
-		if bool(fo["classified"]):
-			var dists: Dictionary = {}
-			var raw_dists: Dictionary = fo["distances"]
-			for dk: String in raw_dists.keys():
-				dists[dk] = float(raw_dists[dk])
+		if bool(fo["classified"]) or bool(fo.get("fb_only", false)):
 			var cross_v: Variant = f_meta.get("cross_pos")
-			detail["verdict"] = {
-				"pitch": String(fo["pitch"]), "confidence": float(fo["confidence"]),
-				"distances": dists, "mph": float(fo["mph"]), "gear": String(fo["gear"]),
+			var v_rec: Dictionary = {
+				"pitch": String(fo["pitch"]),
+				"mph": float(fo["mph"]), "gear": String(fo["gear"]),
 				"plate_cross": _vec3_arr(cross_v) if cross_v is Vector3 else null,
 				"plate_crossed": bool(f_meta.get("crossed", false)),
 				"call": _call_for_flight(f_meta),
 			}
+			if bool(fo["classified"]):
+				var dists: Dictionary = {}
+				var raw_dists: Dictionary = fo["distances"]
+				for dk: String in raw_dists.keys():
+					dists[dk] = float(raw_dists[dk])
+				v_rec["confidence"] = float(fo["confidence"])
+				v_rec["distances"] = dists
+			else:
+				# FB by mode, not by classifier (ninth pass): flagged so
+				# offline analysis never mistakes these for classifications.
+				v_rec["fb_only"] = true
+				v_rec["confidence"] = null
+				v_rec["distances"] = null
+			detail["verdict"] = v_rec
 	_record_throw_attempt(samples, features, speed, intent_dir, true,
 		rec_mode, rec_step, "accepted", "", detail)
 	_refresh_ui()
@@ -1361,23 +1387,40 @@ func _spawn_visual_flight(samples: Array, features: PackedFloat32Array, pitch: S
 
 
 ## Returns an outcome Dictionary for the throw recorder: whether the
-## throw was classified, the verdict when it was, and the flight's meta.
-## Behavior unchanged.
+## throw was classified, whether it was a fastball by mode (FB enrolled,
+## CB not - ninth pass), the verdict when there is one, and the flight's
+## meta.
 func _free_throw(features: PackedFloat32Array, speed: float, samples: Array) -> Dictionary:
-	if not (templates.has("FB") and templates.has("CB")):
-		# No templates yet: the throw still flies as an unclassified "just a
-		# throw" at provisionally mapped speed - a new player who ignores the
-		# panel and throws sees a ball go. Gun board stays dark (quiet).
+	if not templates.has("FB"):
+		# No fastball yet: the throw still flies as an unclassified "just a
+		# throw" at provisionally mapped speed - a new player who ignores
+		# the panel and throws sees a ball go. Gun board stays dark (quiet).
 		var stray_meta: Dictionary = _spawn_visual_flight(samples, features, "FB")
-		last_result = "Enroll a fastball and a curveball first - then the gun goes live."
-		return {"classified": false, "flight_meta": stray_meta}
+		last_result = "Enroll a fastball first - then the gun goes live."
+		return {"classified": false, "fb_only": false, "flight_meta": stray_meta}
 	# Sandbag guard (per spec): beating your calibrated max re-anchors it.
 	if calib_max > 0.01 and speed > calib_max:
 		calib_max = speed
 		last_result = "New personal max - calibration re-anchored to %.2f m/s." % calib_max
-	var verdict: Dictionary = ThrowFeatures.classify(features, templates)
-	var pitch: String = verdict["pitch"]
-	var confidence: float = verdict["confidence"]
+	# FB-only state (fastball enrolled, curveball not): every accepted
+	# throw IS a fastball - the classifier has nothing to separate yet,
+	# so it is never consulted. Full treatment: flight, gun announcement,
+	# PBs. The outcome is flagged fb_only so the recorder never mistakes
+	# these for classifications. The moment a CB template exists, the
+	# classifier path below resumes unchanged.
+	var fb_only: bool = not templates.has("CB")
+	var pitch: String = "FB"
+	var confidence: float = 0.0
+	var distances: Dictionary = {}
+	var classified: bool = false
+	if not fb_only:
+		var verdict: Dictionary = ThrowFeatures.classify(features, templates)
+		pitch = String(verdict["pitch"])
+		confidence = float(verdict["confidence"])
+		var raw_dists: Dictionary = verdict["distances"]
+		for dk: String in raw_dists.keys():
+			distances[dk] = float(raw_dists[dk])
+		classified = true
 	var mph: float = ThrowFeatures.map_velocity(speed, calib_max, boost_mult)
 	var gear: String = ""
 	if pitch == "FB":
@@ -1389,14 +1432,15 @@ func _free_throw(features: PackedFloat32Array, speed: float, samples: Array) -> 
 	# Flight direction = release intent (peak-speed window). Speed still
 	# comes from the release sample via the caller's `speed` - magnitude
 	# semantics unchanged, only the direction stopped trusting the button.
-	var flight_meta: Dictionary = _start_flight(rel_pos, ThrowFeatures.release_intent_dir(samples), mph, pitch, axis, float(spin["rate"]), {
-		"confidence": confidence, "gear": gear, "watch": false,
-	})
+	var meta: Dictionary = {"confidence": confidence, "gear": gear, "watch": false}
+	if fb_only:
+		meta["fb_only"] = true
+	var flight_meta: Dictionary = _start_flight(rel_pos, ThrowFeatures.release_intent_dir(samples), mph, pitch, axis, float(spin["rate"]), meta)
 	release_player.play()
 	return {
-		"classified": true, "pitch": pitch, "confidence": confidence,
-		"distances": verdict["distances"], "mph": mph, "gear": gear,
-		"flight_meta": flight_meta,
+		"classified": classified, "fb_only": fb_only, "pitch": pitch,
+		"confidence": confidence, "distances": distances, "mph": mph,
+		"gear": gear, "flight_meta": flight_meta,
 	}
 
 
@@ -1483,7 +1527,9 @@ func _announce(meta: Dictionary) -> void:
 		_save_profile()
 	var sub: String = "%s - %s" % [_pitch_name(pitch), call]
 	if not bool(meta.get("watch", false)):
-		sub += " - %d%% sure" % int(round(float(meta.get("confidence", 0.0)) * 100.0))
+		# FB-only throws carry no confidence - the classifier never ran.
+		if not bool(meta.get("fb_only", false)):
+			sub += " - %d%% sure" % int(round(float(meta.get("confidence", 0.0)) * 100.0))
 		var gear: String = String(meta.get("gear", ""))
 		if gear != "":
 			sub += " - %s gear" % gear
@@ -1891,6 +1937,9 @@ func _load_profile() -> void:
 	elif templates.has("FB") and templates.has("CB"):
 		mode = Mode.FREE_THROW
 		last_result = "Profile loaded - free throw is live, or go to the box to watch."
+	elif templates.has("FB"):
+		mode = Mode.FREE_THROW
+		last_result = "Profile loaded - free throw is live on fastballs, or go to the box to watch."
 	# Ball visual follows the loaded throwing hand.
 	var ball_parent: Node = ball_in_hand_mesh.get_parent()
 	if ball_parent != null:
