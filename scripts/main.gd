@@ -116,8 +116,11 @@ var gaze_clock: float = 0.0
 # unstable session to session (fitted corrections 0.26 / 7.61 / 8.44
 # deg across sessions 4-6) and the delivery carries its own offset
 # the stance never shows, so the offset is measured where it lives:
-# press "Delivery cal", throw DELIVERY_CAL_COUNT easy free throws
-# aimed at the middle of the pitch box, and the component-wise
+# press "Delivery cal", throw DELIVERY_CAL_COUNT free throws
+# (fifteenth pass: five, thrown like his real pitches - a 3-throw
+# median is one real throw's noise, session 7 overshot y by
+# 0.44 m, and "easy" captures measured the wrong motion) aimed at
+# the middle of the pitch box, and the component-wise
 # MEDIAN of their gaze-corrected targets becomes the delivery
 # anchor. Later targets shift by -(anchor - zone centre), with the
 # centre recomputed from the CURRENT posture's zone values at aim
@@ -125,7 +128,7 @@ var gaze_clock: float = 0.0
 # calibration starts inactive, because a stale anchor from another
 # session's headset seating must never silently apply (the
 # session-lock lesson, tenth pass).
-const DELIVERY_CAL_COUNT: int = 3
+const DELIVERY_CAL_COUNT: int = 5
 var delivery_active: bool = false
 var delivery_anchor: Vector3 = Vector3.ZERO # plate-plane point (z = PLATE_Z), valid when delivery_active
 var delivery_capturing: bool = false
@@ -1989,7 +1992,7 @@ func _delivery_offset() -> Vector2:
 
 
 func _delivery_prompt_text() -> String:
-	return "Delivery calibration: throw %d of %d — EASY throws, aimed at the middle of the pitch box." % [delivery_targets.size() + 1, DELIVERY_CAL_COUNT]
+	return "Delivery calibration: throw %d of %d — throw them like your real pitches, aimed at the middle of the pitch box." % [delivery_targets.size() + 1, DELIVERY_CAL_COUNT]
 
 
 func _delivery_summary_text() -> String:

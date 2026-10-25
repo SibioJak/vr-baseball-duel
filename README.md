@@ -88,8 +88,12 @@ that's the failure mode, not the test.
      8.44° corrections across sessions 4–6 — the headset sits
      differently every time, and a delivery carries an offset a stance
      never shows). So once you're enrolled, press **Delivery cal** (in
-     the re-enroll row) and throw **3 easy pitches aimed at the middle
-     of the pitch box**. Those throws play as ordinary free throws;
+     the re-enroll row) and throw **5 pitches aimed at the middle
+     of the pitch box, thrown like your real pitches** (fifteenth
+     pass — session 7's 3-throw anchor overshot y by 0.44 m: a
+     3-throw median is one throw's noise, and "easy" captures
+     measure a different motion than your real delivery). Those
+     throws play as ordinary free throws;
      behind them, the game takes the median of where your corrected
      eye line actually crossed on those deliveries and cancels that
      offset from every later pitch: "Delivery calibrated — your
@@ -126,10 +130,11 @@ Enrollment persists (`user://duel_profile.json`) — re-tests skip setup.
   and Scatter sliders. The beam flashes on a click.
 - **Your gaze (enrollment)**: look at each lit target and hold still —
   gaze calibration captures by dwell, no buttons.
-- **Delivery cal button** (panel, re-enroll row): starts a 3-throw
-  delivery calibration — throw easy pitches at the middle of the pitch
-  box and the game cancels the offset your delivery look runs from
-  the middle, for this session only (see step 4).
+- **Delivery cal button** (panel, re-enroll row): starts a 5-throw
+  delivery calibration — throw them like your real pitches at the
+  middle of the pitch box and the game cancels the offset your
+  delivery look runs from the middle, for this session only (see
+  step 4).
 - **Quest system button (long-press)**: recenter (OS-level, not bound by the game).
 - Nothing else is bound. There is no keyboard/mouse control in the headset.
 
@@ -285,27 +290,34 @@ Headless, with the real Godot 4.7 binary:
   correction was a constant rotation +1.45 m right of the raw look —
   a fit poisoned by a mismatched capture, certified without ever
   checking that the captures agreed with each other.
-- `tests/delivery_cal.gd` — 38 checks (fourteenth pass): the delivery
-  calibration end to end. Offset math at `_compute_aim` (anchor
-  (0.80, 1.10) against the standing centre (0, 0.77): a throw with
-  that gaze target is applied to (0.00, 0.77) exactly; the same
-  anchor under sitting zone values applies to (0.00, 0.69) — the
-  offset is recomputed per posture at aim time); then the full path
-  through the real panel button and `_finalize_throw`: a headless
-  throw does not count and does not end the set; capture targets
-  (0.80, 1.10), (0.85, 1.05), (2.50, 2.00) anchor at the component
-  MEDIAN (0.85, 1.10), not the mean; no offset is applied during a
-  capture (including a re-capture over a live anchor, which then
-  replaces the anchor on completion); the counted throws are
-  recoverable from the log (flagged `delivery_cal`, their
-  `gaze_cross` values), the state snapshot carries anchor, offsets
-  and the active flag, and a post-calibration free throw keeps its
-  pre-offset `gaze_cross` while its applied target lands on zone
-  centre with `solver_error_m` ≤ 0.02. A fresh instance starts with
-  `delivery_active` false and the panel says so. Negative control:
-  run against the pre-fix code, the suite fails (7 of its first 10
-  checks — no delivery state, no `gaze_cross`, the gaze target
-  returned unshifted).
+- `tests/delivery_cal.gd` — 51 checks (fourteenth pass, set size and
+  prompt updated in the fifteenth): the delivery calibration end to
+  end. Offset math at `_compute_aim` (anchor (0.80, 1.10) against
+  the standing centre (0, 0.77): a throw with that gaze target is
+  applied to (0.00, 0.77) exactly; the same anchor under sitting
+  zone values applies to (0.00, 0.69) — the offset is recomputed
+  per posture at aim time); then the full path through the real
+  panel button and `_finalize_throw`: a headless throw does not
+  count and does not end the set; FIVE capture targets (0.80, 1.10),
+  (0.85, 1.05), (0.75, 1.15), (0.90, 1.00), (2.50, 2.00) anchor at
+  the component MEDIAN (0.85, 1.10) — x from one throw, y from
+  another, no single throw's pair, and not the mean (1.16, 1.26) —
+  so the wild throw cannot drag it; the prompt counts "throw N
+  of 5" and asks for pitches thrown like his real ones (no more
+  "EASY"); no offset is applied during a capture (including a
+  re-capture over a live anchor, which the fresh set replaces only
+  when all 5 complete); the counted throws are recoverable from the
+  log (flagged `delivery_cal`, their `gaze_cross` values), the
+  state snapshot carries anchor, offsets and the active flag, and
+  a post-calibration free throw keeps its pre-offset `gaze_cross`
+  while its applied target lands on zone centre with
+  `solver_error_m` ≤ 0.02. A fresh instance starts with
+  `delivery_active` false and the panel says so. Negative controls:
+  run against the pre-pass-14 code the suite fails outright (no
+  delivery state, no `gaze_cross`, the gaze target returned
+  unshifted); run against the PASS-14 (3-throw) code it fails 17 of
+  51 checks, including the named pass-15 checks — the prompt says
+  "of 3" and the anchor is already active after 3 counted throws.
 - `tests/render_spawn_view.gd` — 44 checks: renders an actual frame of
   the spawn view (Xvfb + GL) with the rig posed as a player stands, and
   saves it to `tests/spawn_view.png`: panel in front with legible UI

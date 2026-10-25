@@ -4,7 +4,7 @@ extends SceneTree
 ## unstable per session (fitted corrections 0.26 / 7.61 / 8.44 deg in
 ## sessions 4-6) and the delivery itself carries an offset the stance
 ## never shows. The fix measures the offset where it lives: press
-## "Delivery cal", throw 3 EASY free throws aimed at the middle of the
+## "Delivery cal", throw free throws aimed at the middle of the
 ## pitch box; the component-wise MEDIAN of their gaze-corrected
 ## targets becomes the delivery anchor, and every later target is
 ## shifted by -(anchor - zone centre), with the centre recomputed
@@ -12,10 +12,18 @@ extends SceneTree
 ## a fresh launch starts uncalibrated, so a stale anchor from another
 ## session's headset seating can never silently apply.
 ##
-## On the PRE-fix code this test fails: there is no delivery state,
-## no button, no gaze_cross in the record, and _compute_aim returns
-## the gaze target unshifted (the negative control). Run:
-##   godot --headless --path . --script tests/delivery_cal.gd
+## Fifteenth pass: the capture set is FIVE counted throws, not three
+## (a 3-throw median is one real throw's value, noise included - the
+## session-7 anchor overshot y by 0.44 m), and the prompt asks for
+## pitches thrown like his real ones, not "EASY" ones (an easy
+## overhand capture set measures a different motion than his angled
+## game-effort slot). Negative controls: against the PRE-pass-14 code
+## this suite fails outright (no delivery state, no button, no
+## gaze_cross, gaze target unshifted); against the PASS-14 code it
+## fails the size checks by name - the panel says "of 3" and the
+## anchor activates after the 3rd counted throw.
+##
+## Run: godot --headless --path . --script tests/delivery_cal.gd
 
 var failures: int = 0
 var checks: int = 0
@@ -193,7 +201,7 @@ func _run() -> void:
 	main.set("delivery_active", false)
 	main.set("delivery_capturing", false)
 
-	# --- full path: button -> 3 capture throws -> corrected --------
+	# --- full path: button -> 5 capture throws -> corrected --------
 	if not main.has_method("_on_delivery_cal"):
 		check(false, "delivery cal: panel handler exists")
 	else:
@@ -203,8 +211,11 @@ func _run() -> void:
 		if btn != null:
 			btn.pressed.emit()
 		check(main.get("delivery_capturing") == true, "delivery cal: pressing the button starts a capture set")
-		check(main.prompt_label.text.contains("Delivery calibration: throw 1 of 3"),
-			"delivery cal: panel prompts throw 1 of 3 at the middle (prompt: %s)" % main.prompt_label.text)
+		check(main.prompt_label.text.contains("Delivery calibration: throw 1 of 5"),
+			"delivery cal: panel prompts throw 1 of 5 (prompt: %s)" % main.prompt_label.text)
+		check(main.prompt_label.text.contains("like your real pitches")
+			and not main.prompt_label.text.contains("EASY"),
+			"delivery cal: prompt asks for real pitches, not EASY ones (prompt: %s)" % main.prompt_label.text)
 
 		# A throw with NO head data must not count and must not end
 		# the capture; its record is not a delivery-cal record.
@@ -212,18 +223,23 @@ func _run() -> void:
 		main._finalize_throw()
 		var tgt_arr_v: Variant = main.get("delivery_targets")
 		check(tgt_arr_v is Array and (tgt_arr_v as Array).is_empty(),
-			"delivery cal: a headless throw does not count toward the 3")
+			"delivery cal: a headless throw does not count toward the 5")
 		check(main.get("delivery_capturing") == true, "delivery cal: capture continues after a headless throw")
 		var headless_rec: Dictionary = last_record()
 		check(headless_rec.get("delivery_cal") != true and headless_rec.get("gaze_cross") == null,
 			"delivery cal: headless record carries no delivery_cal flag and no gaze_cross")
 
-		# The median-robustness set: (0.80, 1.10), (0.85, 1.05) and
-		# one wild (2.50, 2.00) - the anchor must be the component
-		# MEDIAN (0.85, 1.10), not the mean (1.38, 1.38).
+		# The median-of-5 robustness set: four throws around (0.8,
+		# 1.1) and one wild (2.50, 2.00). Component medians: xs sort
+		# 0.75, 0.80, 0.85, 0.90, 2.50 -> 0.85 (throw 2's x); ys sort
+		# 1.00, 1.05, 1.10, 1.15, 2.00 -> 1.10 (throw 1's y) - so the
+		# anchor (0.85, 1.10) is no single throw's pair, the wild
+		# throw cannot drag it, and it is NOT the mean (1.16, 1.26).
 		var cap_targets: Array = [
 			Vector3(0.80, 1.10, ThrowFeatures.PLATE_Z),
 			Vector3(0.85, 1.05, ThrowFeatures.PLATE_Z),
+			Vector3(0.75, 1.15, ThrowFeatures.PLATE_Z),
+			Vector3(0.90, 1.00, ThrowFeatures.PLATE_Z),
 			Vector3(2.50, 2.00, ThrowFeatures.PLATE_Z),
 		]
 		for ci: int in cap_targets.size():
@@ -237,13 +253,32 @@ func _run() -> void:
 			check(arr3(rec.get("target_cross")).distance_to(rec_gaze) < TOL,
 				"delivery cal: during capture no offset is applied (target == gaze_cross)")
 			if ci == 0:
-				check(main.prompt_label.text.contains("throw 2 of 3"),
-					"delivery cal: panel prompts throw 2 of 3 after the first counted throw")
-		check(main.get("delivery_capturing") == false, "delivery cal: capture ends after the 3rd counted throw")
+				check(main.prompt_label.text.contains("throw 2 of 5"),
+					"delivery cal: panel prompts throw 2 of 5 after the first counted throw")
+			if ci == 2:
+				# THE pass-15 negative control by name: three counted
+				# throws must NOT complete the set any more (in the
+				# pass-14 code the calibration activates right here).
+				check(main.get("delivery_capturing") == true,
+					"delivery cal (pass 15): capture is still running after 3 counted throws")
+				check(main.get("delivery_active") == false,
+					"delivery cal (pass 15): anchor is NOT yet active after 3 counted throws")
+		check(main.get("delivery_capturing") == false, "delivery cal: capture ends after the 5th counted throw")
 		check(main.get("delivery_active") == true, "delivery cal: calibration activates on completion")
 		var anchor: Vector3 = main.get("delivery_anchor")
+		check(absf(anchor.x - 0.85) < TOL,
+			"delivery cal: anchor x is the component median 0.85 (got %.2f)" % anchor.x)
+		check(absf(anchor.y - 1.10) < TOL,
+			"delivery cal: anchor y is the component median 1.10 (got %.2f)" % anchor.y)
 		check(anchor.distance_to(Vector3(0.85, 1.10, ThrowFeatures.PLATE_Z)) < TOL,
 			"delivery cal: anchor is the component median (0.85, 1.10), not the mean (got %.2f, %.2f)" % [anchor.x, anchor.y])
+		var anchor_is_a_throw: bool = false
+		for raw_cap: Variant in cap_targets:
+			var cap_pt: Vector3 = raw_cap
+			if absf(anchor.x - cap_pt.x) < TOL and absf(anchor.y - cap_pt.y) < TOL:
+				anchor_is_a_throw = true
+		check(not anchor_is_a_throw,
+			"delivery cal: anchor pair is no single capture throw's pair (components come from different throws)")
 		check(main.last_result.contains("Delivery calibrated")
 			and main.last_result.contains("right") and main.last_result.contains("high")
 			and main.last_result.contains("corrected"),
@@ -271,7 +306,8 @@ func _run() -> void:
 			"delivery cal: a normal free throw after calibration is not flagged delivery_cal")
 
 		# Re-pressing starts a FRESH set: while it runs, the old
-		# anchor must not shift capture throws, and completing the
+		# anchor must not shift capture throws, must not be replaced
+		# early (a 3-throw-old habit), and completing the 5-throw
 		# set replaces the anchor.
 		btn = find_button(main.panel_viewport, "Delivery cal")
 		if btn != null:
@@ -281,10 +317,15 @@ func _run() -> void:
 			"delivery cal: during a re-capture the old offset is not applied")
 		throw_at(Vector3(0.10, 0.80, ThrowFeatures.PLATE_Z))
 		throw_at(Vector3(0.10, 0.80, ThrowFeatures.PLATE_Z))
+		var anchor_mid: Vector3 = main.get("delivery_anchor")
+		check(anchor_mid.distance_to(Vector3(0.85, 1.10, ThrowFeatures.PLATE_Z)) < TOL,
+			"delivery cal (pass 15): 3 re-capture throws do not yet replace the anchor (still %.2f, %.2f)" % [anchor_mid.x, anchor_mid.y])
+		throw_at(Vector3(0.10, 0.80, ThrowFeatures.PLATE_Z))
+		throw_at(Vector3(0.10, 0.80, ThrowFeatures.PLATE_Z))
 		var anchor2: Vector3 = main.get("delivery_anchor")
 		check(main.get("delivery_active") == true
 			and anchor2.distance_to(Vector3(0.10, 0.80, ThrowFeatures.PLATE_Z)) < TOL,
-			"delivery cal: completing a fresh set replaces the anchor (got %.2f, %.2f)" % [anchor2.x, anchor2.y])
+			"delivery cal: completing a fresh 5-throw set replaces the anchor (got %.2f, %.2f)" % [anchor2.x, anchor2.y])
 
 	main._on_wipe()
 	print("---")
