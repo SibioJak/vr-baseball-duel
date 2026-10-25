@@ -217,9 +217,13 @@ static func extract_features(samples: Array) -> PackedFloat32Array:
 const INTENT_MIN_FRAC: float = 0.75
 
 
-static func release_intent_dir(samples: Array) -> Vector3:
+## [peak_idx, lo, hi]: the delivery window - the peak-speed sample and
+## the CONTIGUOUS run of samples at >= INTENT_MIN_FRAC of peak bracketing
+## it. One definition, shared by release_intent_dir and head_summary, so
+## "the delivery window" means the same samples everywhere it is read.
+static func intent_window(samples: Array) -> Array:
 	if samples.is_empty():
-		return Vector3(0.0, 0.0, -1.0)
+		return [0, 0, -1]
 	var peak: float = 0.0
 	var peak_idx: int = 0
 	for i: int in samples.size():
@@ -228,8 +232,6 @@ static func release_intent_dir(samples: Array) -> Vector3:
 		if lv.length() > peak:
 			peak = lv.length()
 			peak_idx = i
-	if peak < 0.01:
-		return Vector3(0.0, 0.0, -1.0)
 	var thresh: float = peak * INTENT_MIN_FRAC
 	var lo: int = peak_idx
 	while lo > 0:
@@ -245,6 +247,20 @@ static func release_intent_dir(samples: Array) -> Vector3:
 		if lv_hi.length() < thresh:
 			break
 		hi += 1
+	return [peak_idx, lo, hi]
+
+
+static func release_intent_dir(samples: Array) -> Vector3:
+	if samples.is_empty():
+		return Vector3(0.0, 0.0, -1.0)
+	var win: Array = intent_window(samples)
+	var peak_idx: int = int(win[0])
+	var peak_s: Dictionary = samples[peak_idx]
+	var peak_lv: Vector3 = peak_s["lv"]
+	if peak_lv.length() < 0.01:
+		return Vector3(0.0, 0.0, -1.0)
+	var lo: int = int(win[1])
+	var hi: int = int(win[2])
 	var acc := Vector3.ZERO
 	for i2: int in range(lo, hi + 1):
 		var s2: Dictionary = samples[i2]
@@ -259,6 +275,73 @@ static func release_intent_dir(samples: Array) -> Vector3:
 			return lv_last.normalized()
 		return Vector3(0.0, 0.0, -1.0)
 	return acc.normalized()
+
+
+## Head-line summary (tenth pass, recorder v2). Session-1 data killed
+## aim-from-hand-velocity: the velocity direction sweeps 8-24 deg per
+## 90 Hz frame near release, so intent directions scattered 12.3 deg on
+## average. The candidate replacement signal is the HEAD line - a real
+## pitcher locks his eyes on the target before the windup and never
+## moves them. Samples may carry the head's world orientation under
+## "hq" (Quaternion, written by main.gd's sampler alongside the hand
+## sample); this reads it back as forward (-Z) directions:
+##   release:  head forward at the release (last) sample,
+##   window:   normalized mean head forward over the SAME delivery
+##             window release intent uses (intent_window),
+##   at_peak:  head forward at the peak hand-speed sample,
+##   stability_deg: max angular deviation (deg) of any in-window head
+##             forward from the window mean - how still the head was
+##             while the arm was at its fastest.
+## No head data (synthetic feeds, v1-era samples) -> has_head false and
+## zeroed fields; callers record nulls, never a fabricated direction.
+static func head_forward(q: Quaternion) -> Vector3:
+	return (q * Vector3(0.0, 0.0, -1.0)).normalized()
+
+
+static func head_summary(samples: Array) -> Dictionary:
+	var out: Dictionary = {
+		"has_head": false, "release": Vector3.ZERO, "window": Vector3.ZERO,
+		"at_peak": Vector3.ZERO, "stability_deg": -1.0,
+	}
+	if samples.is_empty():
+		return out
+	var last: Dictionary = samples[samples.size() - 1]
+	if not last.has("hq"):
+		return out
+	var win: Array = intent_window(samples)
+	var peak_idx: int = int(win[0])
+	var lo: int = int(win[1])
+	var hi: int = int(win[2])
+	var acc := Vector3.ZERO
+	var win_fwds: Array = []
+	for i: int in range(lo, hi + 1):
+		var s: Dictionary = samples[i]
+		var q_v: Variant = s.get("hq", null)
+		if q_v is Quaternion:
+			var q: Quaternion = q_v
+			var f: Vector3 = head_forward(q)
+			win_fwds.append(f)
+			acc += f
+	if win_fwds.is_empty() or acc.length() < 0.0001:
+		return out
+	var mean_dir: Vector3 = acc.normalized()
+	var stability: float = 0.0
+	for raw: Variant in win_fwds:
+		var f2: Vector3 = raw
+		stability = maxf(stability, rad_to_deg(mean_dir.angle_to(f2)))
+	var rel_q_v: Variant = last.get("hq", null)
+	if rel_q_v is Quaternion:
+		var rel_q: Quaternion = rel_q_v
+		out["release"] = head_forward(rel_q)
+	out["window"] = mean_dir
+	var peak_s: Dictionary = samples[peak_idx]
+	var peak_q_v: Variant = peak_s.get("hq", null)
+	if peak_q_v is Quaternion:
+		var peak_q: Quaternion = peak_q_v
+		out["at_peak"] = head_forward(peak_q)
+	out["stability_deg"] = stability
+	out["has_head"] = true
+	return out
 
 
 ## Feature vector as a name -> value Dictionary (FEATURE_NAMES keys),
@@ -356,6 +439,24 @@ static func map_velocity(raw_speed: float, calib_max: float, boost_mult: float) 
 		return clampf(raw_speed * MPH_PER_MPS, MIN_GAME_MPH, MAX_GAME_MPH)
 	var mph: float = PRO_ANCHOR_MPH * (raw_speed / calib_max) * boost_mult
 	return clampf(mph, MIN_GAME_MPH, MAX_GAME_MPH)
+
+
+## Median of a small list of measured speeds. Gear anchors (tenth pass)
+## settle on the median of 3 throws: the old mean of 2 let one wild
+## throw drag the anchor - Chris's MEDIUM anchor came out as the mean of
+## 9.96 and 4.95, two different efforts averaged into mush. Even counts
+## fall back to the mean of the middle pair.
+static func median_of(values: Array) -> float:
+	if values.is_empty():
+		return 0.0
+	var sorted_vals: Array = []
+	for v: Variant in values:
+		sorted_vals.append(float(v))
+	sorted_vals.sort()
+	var mid: int = sorted_vals.size() / 2
+	if sorted_vals.size() % 2 == 1:
+		return float(sorted_vals[mid])
+	return (float(sorted_vals[mid - 1]) + float(sorted_vals[mid])) * 0.5
 
 
 static func gear_for_speed(raw_speed: float, fast_anchor: float, med_anchor: float) -> String:

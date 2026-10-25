@@ -192,6 +192,46 @@ func _init() -> void:
 	check(intent_lag.angle_to(lag_lv.normalized()) > deg_to_rad(20.0),
 		"intent measurably departs from the skewed button frame (%.1f deg)" % rad_to_deg(intent_lag.angle_to(lag_lv.normalized())))
 
+	# --- Head line: the candidate aim signal (tenth pass) ------------------
+	# Samples carry the head's orientation under "hq"; the summary reads
+	# forwards off it over the same delivery window intent uses.
+	var head_const: Array = make_motion(rng, 8.0, false, 0.0)
+	var hq_const: Quaternion = Quaternion.from_euler(Vector3(0.12, -0.2, 0.0))
+	for raw_h: Variant in head_const:
+		var hs: Dictionary = raw_h
+		hs["hp"] = Vector3(0.05, 1.68, 0.4)
+		hs["hq"] = hq_const
+	var hs_const: Dictionary = ThrowFeatures.head_summary(head_const)
+	check(bool(hs_const["has_head"]), "head summary reads head data when present")
+	var expect_f: Vector3 = ThrowFeatures.head_forward(hq_const)
+	var got_rel: Vector3 = hs_const["release"]
+	var got_win: Vector3 = hs_const["window"]
+	var got_peak: Vector3 = hs_const["at_peak"]
+	check(got_rel.angle_to(expect_f) < 0.001 and got_win.angle_to(expect_f) < 0.001 and got_peak.angle_to(expect_f) < 0.001,
+		"a still head: release/window/peak forwards all equal the worn direction")
+	check(absf(float(hs_const["stability_deg"])) < 0.01,
+		"a still head reads 0.0 deg stability (got %.3f)" % float(hs_const["stability_deg"]))
+	# Turning head: yaw sweeps 0 -> 0.60 rad across the motion.
+	var head_rot: Array = make_motion(rng, 8.0, false, 0.0)
+	for hi2: int in head_rot.size():
+		var hs2: Dictionary = head_rot[hi2]
+		var frac: float = float(hi2) / float(head_rot.size() - 1)
+		hs2["hq"] = Quaternion(Vector3.UP, 0.60 * frac)
+	var hs_rot: Dictionary = ThrowFeatures.head_summary(head_rot)
+	check(bool(hs_rot["has_head"]) and float(hs_rot["stability_deg"]) > 2.0,
+		"a turning head reads real instability (%.1f deg)" % float(hs_rot["stability_deg"]))
+	var rot_rel: Vector3 = hs_rot["release"]
+	check(absf(rot_rel.angle_to(Vector3(0.0, 0.0, -1.0)) - 0.60) < 0.03,
+		"head release forward is the release sample's own direction (%.3f rad off -Z)" % rot_rel.angle_to(Vector3(0.0, 0.0, -1.0)))
+	var no_head: Dictionary = ThrowFeatures.head_summary(make_motion(rng, 8.0, false, 0.0))
+	check(not bool(no_head["has_head"]), "samples without head data report has_head false (recorder writes nulls)")
+
+	# --- Median (tenth pass: gear anchors settle on it) --------------------
+	check(absf(ThrowFeatures.median_of([9.96, 4.95, 7.45]) - 7.45) < 0.001,
+		"median of the split gear throws is the middle throw (7.45), not a mean")
+	check(absf(ThrowFeatures.median_of([8.0]) - 8.0) < 0.001, "median of one value is itself")
+	check(absf(ThrowFeatures.median_of([4.0, 8.0]) - 6.0) < 0.001, "median of an even count averages the middle pair")
+
 	# --- Velocity mapping ------------------------------------------------
 	check(absf(ThrowFeatures.map_velocity(8.0, 8.0, 1.0) - 96.0) < 0.01, "calibration max maps to 96 mph")
 	check(absf(ThrowFeatures.map_velocity(4.0, 8.0, 1.0) - 48.0) < 0.01, "half effort maps to 48 mph (ordering preserved)")

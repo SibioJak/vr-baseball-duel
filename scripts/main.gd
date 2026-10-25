@@ -14,6 +14,10 @@ const PROFILE_PATH: String = "user://duel_profile.json"
 # _finalize_throw - accepted AND rejected - is appended as one JSON
 # object per line here, samples and all, so the next tuning pass runs
 # on Chris's real full-windup throws instead of synthetic ones.
+# Tenth pass: records are v2 - each sample also carries the head's
+# position/orientation (hp/hq) and each record precomputes head-line
+# summaries (see _record_throw_attempt). v1 lines stay plain JSONL;
+# nothing in this file reads old records back except the line count.
 const THROW_LOG_PATH: String = "user://throws.jsonl"
 const PLATE_POS: Vector3 = Vector3(0.0, 0.0, -18.44) # 60.5 ft from the mound
 const ZONE_HALF_W: float = 0.216 # 17 in wide zone
@@ -47,6 +51,13 @@ var xr_ok: bool = false
 var throwing_hand: String = "R"
 var posture: String = "STAND"
 var calib_max: float = 0.0
+# Calibration session lock (tenth pass): a free throw harder than
+# calib_max no longer re-anchors the session's gun mid-flight (it moved
+# Chris's scale 5.77 -> 10.32 between throws in the field). The new max
+# is stored here instead and merged into calib_max at the next
+# enrollment start - see _free_throw and _start_enrollment. Persisted
+# in the profile so it survives a restart between the two.
+var pending_calib_max: float = 0.0
 var boost_mult: float = 1.0
 var fast_anchor: float = 0.0
 var med_anchor: float = 0.0
@@ -811,9 +822,9 @@ func _current_prompt() -> String:
 			"p3":
 				return "Optional: show me a THIRD pitch motion (%d of 3) - or press Skip pitch." % [got + 1]
 			"gear_fast":
-				return "Throw a FAST fastball (%d of 2) - your top gear, same motion." % [got + 1]
+				return "Throw a FAST fastball (%d of 3) - your top gear, same motion." % [got + 1]
 			"gear_med":
-				return "Throw a MEDIUM fastball (%d of 2) - same motion, medium speed." % [got + 1]
+				return "Throw a MEDIUM fastball (%d of 3) - same motion, medium speed." % [got + 1]
 	if mode == Mode.WATCH:
 		return "FROM THE BOX - See: %s. Press THROW IT and watch it come in. The arm you see replays YOUR enrolled motion, retimed so its speed matches the number." % watch_selection
 	if templates.has("FB"):
@@ -882,6 +893,7 @@ func _on_wipe() -> void:
 	pitch_release_dir.clear()
 	pbs.clear()
 	calib_max = 0.0
+	pending_calib_max = 0.0
 	fast_anchor = 0.0
 	med_anchor = 0.0
 	separation_note = ""
@@ -891,6 +903,15 @@ func _on_wipe() -> void:
 
 
 func _start_enrollment(steps: Array) -> void:
+	# Calibration session lock (tenth pass): merge a pending personal
+	# max earned in free throw into calib_max BEFORE any calibration
+	# step runs, and persist it - this is where the panel's "applies
+	# next enrollment" note becomes true. During the session itself the
+	# pending value never touches the gun (see _free_throw).
+	if pending_calib_max > calib_max:
+		calib_max = pending_calib_max
+		pending_calib_max = 0.0
+		_save_profile()
 	mode = Mode.SETUP
 	origin.position = Vector3.ZERO
 	origin.rotation = Vector3.ZERO
@@ -919,7 +940,10 @@ func _step_target_count() -> int:
 		"calib", "fb", "cb", "p3":
 			return 3
 		"gear_fast", "gear_med":
-			return 2
+			# 3 throws since the tenth pass: the anchor is their MEDIAN
+			# (see _enrollment_throw) - a median needs an odd count, and
+			# one wild throw can no longer drag it.
+			return 3
 	return 3
 
 
@@ -1012,9 +1036,15 @@ func _physics_process(delta: float) -> void:
 		# (ThrowFeatures.roll_metrics) read the wrist's twist from it.
 		# Grip rides along too - the throw recorder (eighth pass) needs
 		# the squeeze curve to replay a throw offline; feature extraction
-		# ignores the extra key.
+		# ignores the extra key. The HEAD rides along as well (tenth
+		# pass, recorder v2): hp/hq are the XRCamera3D's world position
+		# and orientation at the same instant as this hand sample - the
+		# head line is the candidate aim signal session 1 pointed to,
+		# and v1 never logged it. Feature extraction ignores these too.
 		var smp: Dictionary = ThrowFeatures.make_sample_q(float(now_msec) / 1000.0, pos, smooth_lv, smooth_av, basis_now.get_rotation_quaternion())
 		smp["grip"] = grip
+		smp["hp"] = cam.global_position
+		smp["hq"] = cam.global_transform.basis.get_rotation_quaternion()
 		ring.append(smp)
 		while ring.size() > 120:
 			ring.pop_front()
@@ -1094,6 +1124,7 @@ func _finalize_throw() -> void:
 		var fo: Dictionary = _free_throw(features, speed, samples)
 		var f_meta: Dictionary = fo["flight_meta"]
 		detail["flight"] = _flight_record(f_meta)
+		detail["over_calib_max"] = bool(fo.get("over_calib_max", false))
 		if bool(fo["classified"]) or bool(fo.get("fb_only", false)):
 			var cross_v: Variant = f_meta.get("cross_pos")
 			var v_rec: Dictionary = {
@@ -1132,6 +1163,12 @@ func _finalize_throw() -> void:
 ## calibration state as they stood AFTER the throw was processed - so
 ## each record is self-contained. Recording must never break a throw:
 ## every IO step null-checks and a failure only flags the panel line.
+## Tenth pass (v2): samples also carry the head's position/orientation
+## (hp/hq, written by the sampler) and each record precomputes the
+## head-line summary (head_fwd_release / head_fwd_window /
+## head_fwd_at_peak / head_stability_deg) so offline analysis reads
+## the candidate aim signal directly instead of redoing quaternion
+## math. Throws with no head data record nulls for those fields.
 
 func _init_throw_log() -> void:
 	throw_log_abs_path = ProjectSettings.globalize_path(THROW_LOG_PATH)
@@ -1160,7 +1197,7 @@ func _on_clear_throw_log() -> void:
 
 func _record_throw_attempt(samples: Array, features: PackedFloat32Array, speed: float, intent_dir: Vector3, has_intent: bool, mode_str: String, step_str: String, outcome_str: String, reason: String, detail: Dictionary) -> void:
 	var rec: Dictionary = {}
-	rec["v"] = 1
+	rec["v"] = 2
 	rec["seq"] = throws_recorded + 1
 	rec["ts"] = Time.get_datetime_string_from_system()
 	rec["ts_unix"] = Time.get_unix_time_from_system()
@@ -1198,14 +1235,37 @@ func _record_throw_attempt(samples: Array, features: PackedFloat32Array, speed: 
 			rec["release_frame_dir"] = null
 	rec["intent_dir"] = [intent_dir.x, intent_dir.y, intent_dir.z] if has_intent else null
 	rec["intent_vs_release_deg"] = rad_to_deg(intent_dir.angle_to(rel_dir)) if has_intent and has_rel_dir else null
+	# Head line (recorder v2): precomputed summaries over the same
+	# samples, null when the throw carried no head data (synthetic feeds
+	# in tests, or a too-short ring) - analysis distinguishes "head was
+	# still" (stability ~0) from "head was never measured" (null).
+	var head: Dictionary = ThrowFeatures.head_summary(samples)
+	if bool(head["has_head"]):
+		var h_rel: Vector3 = head["release"]
+		var h_win: Vector3 = head["window"]
+		var h_peak: Vector3 = head["at_peak"]
+		rec["head_fwd_release"] = [h_rel.x, h_rel.y, h_rel.z]
+		rec["head_fwd_window"] = [h_win.x, h_win.y, h_win.z]
+		rec["head_fwd_at_peak"] = [h_peak.x, h_peak.y, h_peak.z]
+		rec["head_stability_deg"] = float(head["stability_deg"])
+	else:
+		rec["head_fwd_release"] = null
+		rec["head_fwd_window"] = null
+		rec["head_fwd_at_peak"] = null
+		rec["head_stability_deg"] = null
 	rec["outcome"] = outcome_str
 	rec["reason"] = reason
 	rec["reason_text"] = last_result
+	# Calibration session lock (tenth pass): true when this free throw
+	# beat the session's frozen calib_max - its new max is pending, NOT
+	# applied (see _free_throw). Always present so analysis can filter.
+	rec["over_calib_max"] = bool(detail.get("over_calib_max", false))
 	rec["enroll"] = detail.get("enroll")
 	rec["verdict"] = detail.get("verdict")
 	rec["flight"] = detail.get("flight")
 	rec["state"] = {
-		"calib_max": calib_max, "fast_anchor": fast_anchor,
+		"calib_max": calib_max, "pending_calib_max": pending_calib_max,
+		"fast_anchor": fast_anchor,
 		"med_anchor": med_anchor, "boost_mult": boost_mult,
 		"templates": _templates_snapshot(),
 	}
@@ -1237,6 +1297,19 @@ func _serialize_samples(samples: Array) -> Array:
 		var av: Vector3 = av_v if av_v is Vector3 else Vector3.ZERO
 		var q_v: Variant = s.get("q", Quaternion.IDENTITY)
 		var q: Quaternion = q_v if q_v is Quaternion else Quaternion.IDENTITY
+		# Head position/orientation (recorder v2): serialized when the
+		# sampler wrote them, null when it didn't - a record must never
+		# invent a head pose for a throw that had none.
+		var hp_v: Variant = s.get("hp", null)
+		var hp_arr: Variant = null
+		if hp_v is Vector3:
+			var hp: Vector3 = hp_v
+			hp_arr = [hp.x, hp.y, hp.z]
+		var hq_v: Variant = s.get("hq", null)
+		var hq_arr: Variant = null
+		if hq_v is Quaternion:
+			var hq: Quaternion = hq_v
+			hq_arr = [hq.x, hq.y, hq.z, hq.w]
 		out.append({
 			"t": float(s["t"]),
 			"p": [p.x, p.y, p.z],
@@ -1244,6 +1317,8 @@ func _serialize_samples(samples: Array) -> Array:
 			"av": [av.x, av.y, av.z],
 			"q": [q.x, q.y, q.z, q.w],
 			"grip": float(s.get("grip", 0.0)),
+			"hp": hp_arr,
+			"hq": hq_arr,
 		})
 	return out
 
@@ -1318,6 +1393,15 @@ func _enrollment_throw(features: PackedFloat32Array, speed: float, samples: Arra
 	for s: float in step_speeds:
 		avg_speed += s
 	avg_speed /= float(step_speeds.size())
+	# The value the GEAR steps settle on is the MEDIAN of their 3 throws
+	# (tenth pass), not the mean: the old mean-of-2 anchored Chris's
+	# MEDIUM gear at the average of 9.96 and 4.95 m/s - two different
+	# efforts averaged into a speed he never actually threw. Calibration
+	# and the pitch motions keep the mean (their 3 throws are coached to
+	# be the same effort; the gears are where variance is the point).
+	var step_value: float = avg_speed
+	if step == "gear_fast" or step == "gear_med":
+		step_value = ThrowFeatures.median_of(step_speeds)
 	match step:
 		"calib":
 			calib_max = avg_speed
@@ -1337,13 +1421,13 @@ func _enrollment_throw(features: PackedFloat32Array, speed: float, samples: Arra
 			last_result = "%s enrolled (avg %.2f m/s)." % [key, avg_speed]
 			_recompute_separation()
 		"gear_fast":
-			fast_anchor = avg_speed
-			last_result = "FAST gear anchored at %.2f m/s." % fast_anchor
+			fast_anchor = step_value
+			last_result = "FAST gear anchored at %.2f m/s (median of 3)." % fast_anchor
 		"gear_med":
-			med_anchor = avg_speed
-			last_result = "MEDIUM gear anchored at %.2f m/s." % med_anchor
+			med_anchor = step_value
+			last_result = "MEDIUM gear anchored at %.2f m/s (median of 3)." % med_anchor
 	outcome["completed"] = true
-	outcome["avg_speed"] = avg_speed
+	outcome["avg_speed"] = step_value if (step == "gear_fast" or step == "gear_med") else avg_speed
 	_advance_step()
 	return outcome
 
@@ -1397,11 +1481,23 @@ func _free_throw(features: PackedFloat32Array, speed: float, samples: Array) -> 
 		# the panel and throws sees a ball go. Gun board stays dark (quiet).
 		var stray_meta: Dictionary = _spawn_visual_flight(samples, features, "FB")
 		last_result = "Enroll a fastball first - then the gun goes live."
-		return {"classified": false, "fb_only": false, "flight_meta": stray_meta}
-	# Sandbag guard (per spec): beating your calibrated max re-anchors it.
+		return {"classified": false, "fb_only": false, "flight_meta": stray_meta, "over_calib_max": false}
+	# Calibration session lock (tenth pass). The old sandbag guard
+	# re-anchored calib_max on the spot - in the field that moved the
+	# gun's scale mid-session (5.77 -> 10.32 m/s between one throw and
+	# the next), so the same effort stopped reading the same number.
+	# Now the session's velocity mapping is FROZEN at the calibration it
+	# started with: an over-max throw is noted on the panel, flagged in
+	# its throw record ("over_calib_max"), stored as pending_calib_max,
+	# and merged into calib_max at the next enrollment start (see
+	# _start_enrollment), where it is also saved.
+	var over_calib: bool = false
 	if calib_max > 0.01 and speed > calib_max:
-		calib_max = speed
-		last_result = "New personal max - calibration re-anchored to %.2f m/s." % calib_max
+		over_calib = true
+		if speed > pending_calib_max:
+			pending_calib_max = speed
+			_save_profile()
+		last_result = "New personal max (%.2f m/s) - applies next enrollment. This session's gun still reads off your %.2f m/s calibration." % [speed, calib_max]
 	# FB-only state (fastball enrolled, curveball not): every accepted
 	# throw IS a fastball - the classifier has nothing to separate yet,
 	# so it is never consulted. Full treatment: flight, gun announcement,
@@ -1441,6 +1537,7 @@ func _free_throw(features: PackedFloat32Array, speed: float, samples: Array) -> 
 		"classified": classified, "fb_only": fb_only, "pitch": pitch,
 		"confidence": confidence, "distances": distances, "mph": mph,
 		"gear": gear, "flight_meta": flight_meta,
+		"over_calib_max": over_calib,
 	}
 
 
@@ -1843,6 +1940,7 @@ func _save_profile() -> void:
 		"hand": throwing_hand,
 		"posture": posture,
 		"calib_max": calib_max,
+		"pending_calib_max": pending_calib_max,
 		"boost": boost_mult,
 		"fast_anchor": fast_anchor,
 		"med_anchor": med_anchor,
@@ -1884,6 +1982,7 @@ func _load_profile() -> void:
 	throwing_hand = String(data.get("hand", "R"))
 	posture = String(data.get("posture", "STAND"))
 	calib_max = float(data.get("calib_max", 0.0))
+	pending_calib_max = float(data.get("pending_calib_max", 0.0))
 	boost_mult = clampf(float(data.get("boost", 1.0)), 0.8, 1.2)
 	fast_anchor = float(data.get("fast_anchor", 0.0))
 	med_anchor = float(data.get("med_anchor", 0.0))

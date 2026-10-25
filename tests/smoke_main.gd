@@ -121,8 +121,8 @@ func _run() -> void:
 		"default enrollment is fastball-only (calib, fb, gears)")
 	feed(main, false, 8.0, 3) # calib
 	feed(main, false, 8.1, 3) # fb
-	feed(main, false, 8.05, 2) # gear fast
-	feed(main, false, 6.9, 2) # gear medium
+	feed(main, false, 8.05, 3) # gear fast (3 throws, median anchor - tenth pass)
+	feed(main, false, 6.9, 3) # gear medium
 	check(not main.enrolling, "FB-only enrollment completed")
 	check(main.templates.has("FB") and not main.templates.has("CB"),
 		"FB enrolled, CB not (FB-only state)")
@@ -181,8 +181,8 @@ func _run() -> void:
 	feed(main, true, 6.3, 3) # cb
 	check(main.templates.has("FB") and main.templates.has("CB"), "FB + CB templates enrolled")
 	main._on_skip() # optional third pitch skipped
-	feed(main, false, 8.05, 2) # gear fast
-	feed(main, false, 6.9, 2) # gear medium
+	feed(main, false, 8.05, 3) # gear fast (3 throws, median anchor - tenth pass)
+	feed(main, false, 6.9, 3) # gear medium
 	check(not main.enrolling, "enrollment completed")
 	check(main.flights.size() >= 10,
 		"enrollment throws all flew (quiet) - %d in the air" % main.flights.size())
@@ -234,6 +234,8 @@ func _run() -> void:
 			and (rec_verdict as Dictionary).has("plate_cross"),
 			"recorder: plate crossing + call recorded")
 		check(String(rec.get("outcome", "")) == "accepted", "recorder: outcome accepted")
+		check(rec.get("head_fwd_release") == null and rec.get("head_stability_deg") == null,
+			"recorder v2: a throw without head data records null head fields, no crash")
 	var soft: Array = []
 	for si: int in 20:
 		soft.append(ThrowFeatures.make_sample(float(si) / 90.0, Vector3(0.2, 1.4, 0.3), Vector3(0.0, 0.0, -0.5), Vector3.ZERO))
@@ -252,6 +254,76 @@ func _run() -> void:
 	main._finalize_throw()
 	check(main.throws_recorded == 1, "recorder: recording resumes after clear")
 
+	# Recorder v2 (tenth pass): the head line rides in the ring. A throw
+	# whose samples carry a fixed head pose must land in the log with
+	# per-sample hp/hq AND the four precomputed head summaries.
+	main._on_clear_throw_log()
+	var head_motion: Array = make_motion(7.9, false)
+	var head_q := Quaternion.from_euler(Vector3(0.12, -0.2, 0.0))
+	for raw_h: Variant in head_motion:
+		var hs: Dictionary = raw_h
+		hs["hp"] = Vector3(0.05, 1.68, 0.4)
+		hs["hq"] = head_q
+	main.ring = head_motion.duplicate()
+	main._finalize_throw()
+	check(main.throws_recorded == 1, "recorder v2: head throw appended")
+	var h_lines: Array = FileAccess.get_file_as_string("user://throws.jsonl").split("\n", false)
+	var h_parsed: Variant = JSON.parse_string(h_lines[0]) if h_lines.size() == 1 else null
+	check(h_parsed is Dictionary and int((h_parsed as Dictionary).get("v", 0)) == 2,
+		"recorder v2: record version is 2")
+	if h_parsed is Dictionary:
+		var h_rec: Dictionary = h_parsed
+		var h_samples: Variant = h_rec.get("samples")
+		var h_first: Variant = null
+		if h_samples is Array and not (h_samples as Array).is_empty():
+			h_first = (h_samples as Array)[0]
+		check(h_first is Dictionary and (h_first as Dictionary).get("hp") is Array
+			and ((h_first as Dictionary)["hp"] as Array).size() == 3
+			and (h_first as Dictionary).get("hq") is Array
+			and ((h_first as Dictionary)["hq"] as Array).size() == 4,
+			"recorder v2: samples carry hp[3] + hq[4]")
+		var h_rel_f: Variant = h_rec.get("head_fwd_release")
+		var expect_f: Vector3 = (head_q * Vector3(0.0, 0.0, -1.0)).normalized()
+		var got_f := Vector3.ZERO
+		if h_rel_f is Array and (h_rel_f as Array).size() == 3:
+			var h_rel_a: Array = h_rel_f
+			got_f = Vector3(float(h_rel_a[0]), float(h_rel_a[1]), float(h_rel_a[2]))
+		check(h_rel_f is Array and got_f.angle_to(expect_f) < 0.01,
+			"recorder v2: head_fwd_release matches the worn head pose")
+		check(h_rec.get("head_fwd_window") is Array and h_rec.get("head_fwd_at_peak") is Array,
+			"recorder v2: head_fwd_window + head_fwd_at_peak present")
+		check(absf(float(h_rec.get("head_stability_deg", -1.0))) < 0.5,
+			"recorder v2: a still head reads ~0 deg stability (got %s)" % str(h_rec.get("head_stability_deg")))
+	else:
+		check(false, "recorder v2: head record parses as JSON")
+
+	# Calibration session lock (tenth pass): a free throw over the
+	# calibrated max must NOT move this session's gun. It notes the max
+	# on the panel, flags the record, stores it pending - and the
+	# pending max merges into calib_max at the next enrollment start.
+	main._on_clear_throw_log()
+	main.calib_max = 5.0
+	var lock_motion: Array = make_motion(7.9, false)
+	var lock_feats: PackedFloat32Array = ThrowFeatures.extract_features(lock_motion)
+	var lock_v: Variant = main._free_throw(lock_feats, 7.9, lock_motion)
+	var lock_o: Dictionary = lock_v if lock_v is Dictionary else {}
+	check(absf(main.calib_max - 5.0) < 0.001,
+		"calib lock: over-max free throw leaves calib_max at 5.00 (got %.2f)" % main.calib_max)
+	check(bool(lock_o.get("over_calib_max", false)), "calib lock: outcome flags over_calib_max")
+	check(absf(main.pending_calib_max - 7.9) < 0.001,
+		"calib lock: pending max stored (%.2f)" % main.pending_calib_max)
+	check(main.last_result.contains("applies next enrollment"),
+		"calib lock: panel notes the pending max (%s)" % main.last_result)
+	main.ring = lock_motion.duplicate()
+	main._finalize_throw()
+	var lock_lines: Array = FileAccess.get_file_as_string("user://throws.jsonl").split("\n", false)
+	var lock_parsed: Variant = JSON.parse_string(lock_lines[lock_lines.size() - 1]) if not lock_lines.is_empty() else null
+	check(lock_parsed is Dictionary and bool((lock_parsed as Dictionary).get("over_calib_max", false)),
+		"calib lock: throw record flags over_calib_max")
+	main._start_enrollment(["calib"])
+	check(absf(main.calib_max - 7.9) < 0.001 and main.pending_calib_max <= 0.001,
+		"calib lock: pending max merges into calib_max at enrollment start (%.2f)" % main.calib_max)
+
 	# Watch mode: AI replays the enrolled motion, retimed.
 	main._set_mode(2) # Mode.WATCH
 	main._on_throw_it()
@@ -266,6 +338,24 @@ func _run() -> void:
 	check(main.templates.has("FB") and main.templates.has("CB"), "profile reload restores templates")
 	check(String(main.templates["CB"].get("cue", "")) == "shade", "profile reload restores the CB cue on the template")
 	check(main.cb_cue == "shade", "profile reload restores the cue picker selection")
+
+	# Gear anchors (tenth pass): the step takes 3 throws and settles on
+	# their MEDIAN. Feed the split pair from Chris's field session
+	# (9.96 + 4.95 - the throws that averaged into mush) plus a middle
+	# throw: the step must NOT complete at 2, and the anchor must be
+	# the middle value exactly, not any mean (mean of 3 = 7.4533,
+	# mean of the old 2 = 7.455 - both outside the tolerance).
+	main._start_enrollment(["gear_fast"])
+	main.fast_anchor = 0.0
+	var gear_motion: Array = make_motion(8.0, false)
+	var gear_feats: PackedFloat32Array = ThrowFeatures.extract_features(gear_motion)
+	main._enrollment_throw(gear_feats, 9.96, gear_motion)
+	main._enrollment_throw(gear_feats, 4.95, gear_motion)
+	check(main.enrolling and main.fast_anchor <= 0.001,
+		"gear step does not complete at 2 throws anymore")
+	main._enrollment_throw(gear_feats, 7.45, gear_motion)
+	check(absf(main.fast_anchor - 7.45) < 0.002,
+		"gear anchor is the MEDIAN of 3 (got %.3f)" % main.fast_anchor)
 
 	# Profile v1 -> v2 upgrade (seventh pass): the v1 file's templates
 	# hold 12-feature vectors the v2 classifier must NOT silently read.
