@@ -112,6 +112,25 @@ var gaze_captures: Array = [] # {head_pos, head_fwd, target} per captured target
 var gaze_hist: Array = [] # [elapsed_s, Vector3 fwd] rolling dwell window
 var gaze_clock: float = 0.0
 
+# Delivery calibration (fourteenth pass). The standing gaze fit is
+# unstable session to session (fitted corrections 0.26 / 7.61 / 8.44
+# deg across sessions 4-6) and the delivery carries its own offset
+# the stance never shows, so the offset is measured where it lives:
+# press "Delivery cal", throw DELIVERY_CAL_COUNT easy free throws
+# aimed at the middle of the pitch box, and the component-wise
+# MEDIAN of their gaze-corrected targets becomes the delivery
+# anchor. Later targets shift by -(anchor - zone centre), with the
+# centre recomputed from the CURRENT posture's zone values at aim
+# time. Runtime only - NEVER persisted: at every launch the delivery
+# calibration starts inactive, because a stale anchor from another
+# session's headset seating must never silently apply (the
+# session-lock lesson, tenth pass).
+const DELIVERY_CAL_COUNT: int = 3
+var delivery_active: bool = false
+var delivery_anchor: Vector3 = Vector3.ZERO # plate-plane point (z = PLATE_Z), valid when delivery_active
+var delivery_capturing: bool = false
+var delivery_targets: Array = [] # Vector3 gaze crosses collected in the live capture set
+
 # ---------------------------------------------------------------- nodes
 var origin: XROrigin3D
 var cam: XRCamera3D
@@ -623,6 +642,7 @@ func _build_panel() -> void:
 	re_row.add_child(_btn("Re-enroll CB", func() -> void: _start_enrollment(["cb"])))
 	re_row.add_child(_btn("Re-enroll 3rd", func() -> void: _start_enrollment(["p3"])))
 	re_row.add_child(_btn("Re-gaze", func() -> void: _start_enrollment(["gaze"])))
+	re_row.add_child(_btn("Delivery cal", _on_delivery_cal))
 	re_row.add_child(_btn("Erase profile", _on_wipe))
 
 	# CB cue picker: only visible while the curveball enrollment step is
@@ -858,6 +878,15 @@ func _refresh_ui() -> void:
 			status += "Gaze calibrated (offset up to %.0f deg, corrected). " % gaze_offset_deg
 		else:
 			status += "Gaze NOT calibrated - press Re-gaze; until then aim uses your raw head line. "
+	# Delivery calibration state (fourteenth pass): always visible,
+	# because the anchor is per-session and silently stale is the one
+	# failure this design refuses.
+	if delivery_capturing:
+		status += "Delivery: calibrating — throw %d of %d at the middle. " % [delivery_targets.size() + 1, DELIVERY_CAL_COUNT]
+	elif delivery_active:
+		status += _delivery_summary_text() + " "
+	else:
+		status += "Delivery: not calibrated this session. "
 	if not pbs.is_empty():
 		var pb_parts: Array = []
 		for k: String in pbs.keys():
@@ -895,6 +924,8 @@ func _current_prompt() -> String:
 				return "Throw a MEDIUM fastball (%d of 3) - same motion, medium speed." % [got + 1]
 	if mode == Mode.WATCH:
 		return "FROM THE BOX - See: %s. Press THROW IT and watch it come in. The arm you see replays YOUR enrolled motion, retimed so its speed matches the number." % watch_selection
+	if delivery_capturing:
+		return _delivery_prompt_text()
 	if templates.has("FB"):
 		if templates.has("CB"):
 			return "FREE THROW - Grip, throw, release, and LOOK at your spot - your eyes aim the pitch, your arm powers it. The gun reads every pitch: type, confidence, velocity."
@@ -978,6 +1009,10 @@ func _on_wipe() -> void:
 	gaze_offset_deg = 0.0
 	gaze_fit_error_deg = -1.0
 	gaze_dropped_count = 0
+	delivery_active = false
+	delivery_capturing = false
+	delivery_anchor = Vector3.ZERO
+	delivery_targets.clear()
 	separation_note = ""
 	last_result = "Profile erased. Enroll again when ready."
 	_play_click()
@@ -1246,6 +1281,18 @@ func _finalize_throw() -> void:
 				v_rec["confidence"] = null
 				v_rec["distances"] = null
 			detail["verdict"] = v_rec
+	# Delivery calibration (fourteenth pass): an accepted FREE throw
+	# made while a capture set is live counts toward it when its aim
+	# carried a valid gaze cross. Counted BEFORE the record is
+	# written, so the record's state snapshot - taken after the throw
+	# was processed, like the rest - already shows a completed
+	# calibration on the throw that completes it.
+	if delivery_capturing and rec_mode == "free":
+		var cap_aim_v: Variant = detail.get("aim")
+		if cap_aim_v is Dictionary:
+			var cap_gc_v: Variant = (cap_aim_v as Dictionary).get("gaze_cross")
+			if cap_gc_v is Vector3:
+				_count_delivery_throw(cap_gc_v)
 	_record_throw_attempt(samples, features, speed, intent_dir, true,
 		rec_mode, rec_step, "accepted", "", detail)
 	_refresh_ui()
@@ -1368,6 +1415,13 @@ func _record_throw_attempt(samples: Array, features: PackedFloat32Array, speed: 
 		rec["head_cross_raw"] = _vec3_arr(hcr_v) if hcr_v is Vector3 else null
 		var tc_v: Variant = aim_d.get("target_cross", null)
 		rec["target_cross"] = _vec3_arr(tc_v) if tc_v is Vector3 else null
+		# Fourteenth pass: the pre-delivery-offset gaze target rides
+		# beside the applied one (identical when no anchor is active),
+		# and throws a delivery capture set counted are flagged, so
+		# the counted targets are recoverable from the log alone.
+		var gc_v: Variant = aim_d.get("gaze_cross", null)
+		rec["gaze_cross"] = _vec3_arr(gc_v) if gc_v is Vector3 else null
+		rec["delivery_cal"] = bool(aim_d.get("delivery_cal", false))
 		var ac_v: Variant = aim_d.get("aim_cross", null)
 		rec["aim_cross"] = _vec3_arr(ac_v) if ac_v is Vector3 else null
 		rec["scatter_k"] = float(aim_d.get("scatter_k", scatter_k))
@@ -1379,6 +1433,8 @@ func _record_throw_attempt(samples: Array, features: PackedFloat32Array, speed: 
 	else:
 		rec["head_cross_raw"] = null
 		rec["target_cross"] = null
+		rec["gaze_cross"] = null
+		rec["delivery_cal"] = false
 		rec["aim_cross"] = null
 		rec["scatter_k"] = scatter_k
 		rec["gaze_calibrated"] = gaze_calibrated
@@ -1403,6 +1459,14 @@ func _record_throw_attempt(samples: Array, features: PackedFloat32Array, speed: 
 		"gaze_correction_quat": [gaze_correction.x, gaze_correction.y, gaze_correction.z, gaze_correction.w],
 		"gaze_offset_deg": snappedf(gaze_offset_deg, 0.01),
 		"gaze_fit_residual_deg": snappedf(gaze_fit_error_deg, 0.01),
+		# Fourteenth pass: the delivery calibration as it stood for
+		# this throw - runtime state, never in the profile, so a
+		# record also proves whether an anchor was live. The offsets
+		# are against the zone centre of the throw's own posture.
+		"delivery_anchor": [delivery_anchor.x, delivery_anchor.y, delivery_anchor.z] if delivery_active else null,
+		"delivery_offset_x": float(_delivery_offset().x),
+		"delivery_offset_y": float(_delivery_offset().y),
+		"delivery_active": delivery_active,
 		"templates": _templates_snapshot(),
 	}
 	_append_throw_record(rec)
@@ -1595,7 +1659,10 @@ func _enrollment_flight_pitch(step: String) -> String:
 ## byte-identically. Otherwise:
 ##   target T  = the gaze-corrected head ray's plate cross (the head
 ##               position + window-mean forward from recorder v2's
-##               head_summary, rotated by the fitted gaze correction)
+##               head_summary, rotated by the fitted gaze correction),
+##               shifted by the delivery-calibration offset when an
+##               anchor is active (fourteenth pass - the unshifted
+##               cross rides in the public block as gaze_cross)
 ##   intent I  = the hand intent ray's straight-line plate cross
 ##   aim A     = T + (I - T) * scatter_k - a delivery whose hand agrees
 ##               with the head flies true to the look; a sloppy one
@@ -1618,7 +1685,15 @@ func _compute_aim(samples: Array, rel_pos: Vector3, mph: float, spin_axis: Vecto
 	var corr_cross_d: Dictionary = ThrowFeatures.plate_cross(head_pos, corr_fwd)
 	if not bool(corr_cross_d["crossed"]):
 		return {}
-	var target: Vector3 = corr_cross_d["cross"]
+	var gaze_target: Vector3 = corr_cross_d["cross"]
+	# Delivery calibration (fourteenth pass): shift the gaze target
+	# by the delivery offset measured this session. While a capture
+	# set is running NO offset applies - the capture throws are what
+	# measures it, even when re-calibrating over an active anchor.
+	var target: Vector3 = gaze_target
+	if delivery_active and not delivery_capturing:
+		var off: Vector2 = _delivery_offset()
+		target = Vector3(gaze_target.x - off.x, gaze_target.y - off.y, gaze_target.z)
 	var intent_dir: Vector3 = ThrowFeatures.release_intent_dir(samples)
 	var intent_cross_d: Dictionary = ThrowFeatures.plate_cross(rel_pos, intent_dir)
 	var intent_cross: Vector3 = target
@@ -1645,7 +1720,13 @@ func _compute_aim(samples: Array, rel_pos: Vector3, mph: float, spin_axis: Vecto
 			aim_pt = fb_target
 			solved = solved_fb
 	var pub: Dictionary = {
-		"target_cross": target, "aim_cross": aim_pt,
+		# Fourteenth pass: target_cross is the APPLIED target (after
+		# the delivery offset); gaze_cross is the pre-offset
+		# gaze-corrected target (identical when no anchor is active,
+		# and the value a capture set counts). delivery_cal flags the
+		# throws a capture set is counting.
+		"target_cross": target, "gaze_cross": gaze_target, "aim_cross": aim_pt,
+		"delivery_cal": delivery_capturing,
 		"scatter_k": scatter_k, "gaze_calibrated": gaze_calibrated,
 		# Thirteenth pass: the solver's final error against the aim
 		# rides in every record that carries an aim, so a future
@@ -1882,6 +1963,74 @@ func _pitch_name(pitch: String) -> String:
 		"P3":
 			return "THIRD PITCH"
 	return pitch
+
+
+# ---------------------------------------------------------------- delivery calibration (fourteenth pass)
+## The gaze fit is measured standing still; the offset that matters
+## lives in the delivery. "Delivery cal" starts a capture set of
+## ordinary free throws aimed at the middle of the pitch box; each
+## accepted throw with a valid gaze target contributes that target,
+## and the component-wise median of the set becomes the anchor.
+## Applying it is a plate-space shift computed at aim time (see
+## _compute_aim), so a posture change re-derives the y term from the
+## current zone instead of staling it.
+
+func _zone_centre() -> Vector3:
+	return Vector3(0.0, (zone_bottom + zone_top) * 0.5, ThrowFeatures.PLATE_Z)
+
+
+## The anchor's offset from the CURRENT zone centre, in metres
+## (x, y). Zero when no delivery calibration is active.
+func _delivery_offset() -> Vector2:
+	if not delivery_active:
+		return Vector2.ZERO
+	var c: Vector3 = _zone_centre()
+	return Vector2(delivery_anchor.x - c.x, delivery_anchor.y - c.y)
+
+
+func _delivery_prompt_text() -> String:
+	return "Delivery calibration: throw %d of %d — EASY throws, aimed at the middle of the pitch box." % [delivery_targets.size() + 1, DELIVERY_CAL_COUNT]
+
+
+func _delivery_summary_text() -> String:
+	var off: Vector2 = _delivery_offset()
+	var x_word: String = "right" if off.x >= 0.0 else "left"
+	var y_word: String = "high" if off.y >= 0.0 else "low"
+	return "Delivery calibrated — your delivery look runs %s %.2f m, %s %.2f m of the middle; corrected." % [x_word, absf(off.x), y_word, absf(off.y)]
+
+
+func _on_delivery_cal() -> void:
+	delivery_capturing = true
+	delivery_targets.clear()
+	last_result = _delivery_prompt_text()
+	_play_click()
+	_refresh_ui()
+
+
+## One counted capture throw: its gaze target joins the set. Called
+## from _finalize_throw only for accepted free throws whose aim
+## carried a valid gaze cross - a throw without a head target never
+## reaches here and the capture simply continues.
+func _count_delivery_throw(gaze_cross: Vector3) -> void:
+	delivery_targets.append(gaze_cross)
+	if delivery_targets.size() >= DELIVERY_CAL_COUNT:
+		_finish_delivery_capture()
+	else:
+		last_result = _delivery_prompt_text()
+
+
+func _finish_delivery_capture() -> void:
+	var xs: Array = []
+	var ys: Array = []
+	for raw_t: Variant in delivery_targets:
+		var t: Vector3 = raw_t
+		xs.append(t.x)
+		ys.append(t.y)
+	delivery_anchor = Vector3(ThrowFeatures.median_of(xs), ThrowFeatures.median_of(ys), ThrowFeatures.PLATE_Z)
+	delivery_active = true
+	delivery_capturing = false
+	delivery_targets.clear()
+	last_result = _delivery_summary_text()
 
 
 # ---------------------------------------------------------------- gaze calibration (eleventh pass)
