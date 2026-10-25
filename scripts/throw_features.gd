@@ -21,6 +21,21 @@ extends RefCounted
 
 const PROFILE_VERSION: int = 2
 const FEATURE_COUNT: int = 15
+# Human-readable name per feature index, in vector order. Doubles as
+# documentation and as the key set for labeled feature dumps (the
+# eighth-pass throw recorder writes features under these names so a
+# recorded throw can be replayed/analyzed offline without this file).
+const FEATURE_NAMES: Array[String] = [
+	"release_speed_mps", # 0
+	"release_height_m", # 1
+	"release_dir_x", "release_dir_y", "release_dir_z", # 2-4
+	"peak_angular_speed_rad_s", # 5
+	"release_angvel_dir_x", "release_angvel_dir_y", "release_angvel_dir_z", # 6-8
+	"late_angvel_x", "late_angvel_y", "late_angvel_z", # 9-11 (rad/s / 10)
+	"roll_total_rad", # 12 total forearm roll across the delivery
+	"roll_peak_rate_rad_s", # 13
+	"roll_orient_change_rad", # 14 hand orientation change, start -> release
+]
 # Per-feature distance scales (units of "typical meaningful difference").
 const FEATURE_SCALES: Array[float] = [
 	3.0, # 0 release speed m/s
@@ -244,6 +259,15 @@ static func release_intent_dir(samples: Array) -> Vector3:
 			return lv_last.normalized()
 		return Vector3(0.0, 0.0, -1.0)
 	return acc.normalized()
+
+
+## Feature vector as a name -> value Dictionary (FEATURE_NAMES keys),
+## for logs/records that must stay readable without this source file.
+static func labeled_features(f: PackedFloat32Array) -> Dictionary:
+	var out: Dictionary = {}
+	for i: int in FEATURE_COUNT:
+		out[FEATURE_NAMES[i]] = f[i] if i < f.size() else 0.0
+	return out
 
 
 static func feature_distance(a: PackedFloat32Array, b: PackedFloat32Array) -> float:

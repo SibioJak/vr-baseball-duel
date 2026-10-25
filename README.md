@@ -130,13 +130,17 @@ Headless, with the real Godot 4.7 binary:
   stays on the peak-speed direction (0.0°) while the skewed final frame
   sits 38° away; flight geometry asserts fastball drop ≥ 0.80 m (0.81)
   and curveball total break ≥ 0.35 m (0.36). All pass.
-- `tests/smoke_main.gd` — 31 checks driving the real main scene: full
+- `tests/smoke_main.gd` — 45 checks driving the real main scene: full
   enrollment flow, free throw classified and announced ("FASTBALL at 95 mph"),
   watch-mode curveball announced, profile save/reload/wipe — plus the
   cue flow (picker + ghost show only on the CB step, the chosen picture
-  is stored with the template and survives a reload) and the v1→v2
+  is stored with the template and survives a reload), the v1→v2
   profile upgrade (templates dropped with an explanation, calibration
-  carried over). All pass.
+  carried over), and the eighth-pass throw recorder (an accepted free
+  throw through `_finalize_throw` appends a parseable JSONL record with
+  samples, 15 labeled features, both release directions and the
+  verdict; a too-soft rejection appends its reason; Clear truncates).
+  All pass.
 - `tests/render_spawn_view.gd` — 44 checks: renders an actual frame of
   the spawn view (Xvfb + GL) with the rig posed as a player stands, and
   saves it to `tests/spawn_view.png`: panel in front with legible UI

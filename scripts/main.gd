@@ -10,6 +10,11 @@ extends Node3D
 ## All math lives in ThrowFeatures / ProfileStore and is headless-tested.
 
 const PROFILE_PATH: String = "user://duel_profile.json"
+# Eighth pass (measurement only): every throw attempt that reaches
+# _finalize_throw - accepted AND rejected - is appended as one JSON
+# object per line here, samples and all, so the next tuning pass runs
+# on Chris's real full-windup throws instead of synthetic ones.
+const THROW_LOG_PATH: String = "user://throws.jsonl"
 const PLATE_POS: Vector3 = Vector3(0.0, 0.0, -18.44) # 60.5 ft from the mound
 const ZONE_HALF_W: float = 0.216 # 17 in wide zone
 const BALL_R: float = 0.037
@@ -59,6 +64,9 @@ var step_speeds: Array = []
 var step_last_motion: Array = []
 var separation_note: String = ""
 var last_result: String = "No pitches yet."
+var throws_recorded: int = 0 # lines in THROW_LOG_PATH (counted at startup)
+var throw_log_abs_path: String = "" # globalized THROW_LOG_PATH, shown on the panel
+var throw_log_failed: bool = false # a write failed; the panel line says so once
 var cb_cue: String = "doorknob" # chosen CB cue key (CB_CUES), stored with the CB template
 
 var watch_selection: String = "MIX"
@@ -110,6 +118,7 @@ var begin_btn: Button
 var skip_btn: Button
 var cue_row: HBoxContainer
 var cue_btns: Dictionary = {} # cue key -> Button
+var throws_label: Label
 var watch_row: HBoxContainer
 var boost_slider: HSlider
 var boost_value_label: Label
@@ -145,6 +154,7 @@ func _ready() -> void:
 	_build_ghost()
 	_build_audio()
 	_load_profile()
+	_init_throw_log()
 	_refresh_ui()
 	_show_on_board("--", "VR BASEBALL DUEL - FEEL TEST")
 
@@ -650,6 +660,20 @@ func _build_panel() -> void:
 	debug_label.text = "DEBUG: waiting for first update..."
 	vbox.add_child(debug_label)
 
+	# Throw recorder line (eighth pass): how many throws are on disk and
+	# the log's absolute path, so the file can be found without guessing.
+	# Clear starts a clean session.
+	var throws_row := HBoxContainer.new()
+	throws_row.add_theme_constant_override("separation", 8)
+	vbox.add_child(throws_row)
+	throws_label = Label.new()
+	throws_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	throws_label.add_theme_font_size_override("font_size", 17)
+	throws_label.add_theme_color_override("font_color", Color(0.6, 0.9, 0.75))
+	throws_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	throws_row.add_child(throws_label)
+	throws_row.add_child(_btn("Clear throw log", _on_clear_throw_log))
+
 	panel_root = Node3D.new()
 	add_child(panel_root)
 	_box(panel_root, Vector3.ZERO, Vector3(PANEL_M.x + 0.06, PANEL_M.y + 0.06, 0.04), _mat(Color(0.06, 0.07, 0.1)))
@@ -756,6 +780,10 @@ func _refresh_ui() -> void:
 			pb_parts.append("%s PB %d" % [k, int(round(float(pbs[k])))])
 		status += " | ".join(pb_parts) + ". "
 	status_label.text = status
+	if throws_label != null:
+		throws_label.text = "Throws recorded: %d - log: %s" % [throws_recorded, throw_log_abs_path]
+		if throw_log_failed:
+			throws_label.text += " (WRITE FAILED)"
 	result_label.text = last_result
 	separation_label.text = separation_note
 	prompt_label.text = _current_prompt()
@@ -966,7 +994,12 @@ func _physics_process(delta: float) -> void:
 	if holding:
 		# Orientation rides along in every sample: the roll features
 		# (ThrowFeatures.roll_metrics) read the wrist's twist from it.
-		ring.append(ThrowFeatures.make_sample_q(float(now_msec) / 1000.0, pos, smooth_lv, smooth_av, basis_now.get_rotation_quaternion()))
+		# Grip rides along too - the throw recorder (eighth pass) needs
+		# the squeeze curve to replay a throw offline; feature extraction
+		# ignores the extra key.
+		var smp: Dictionary = ThrowFeatures.make_sample_q(float(now_msec) / 1000.0, pos, smooth_lv, smooth_av, basis_now.get_rotation_quaternion())
+		smp["grip"] = grip
+		ring.append(smp)
 		while ring.size() > 120:
 			ring.pop_front()
 	if holding and prev_grip > 0.3 and grip <= 0.3:
@@ -979,7 +1012,25 @@ func _physics_process(delta: float) -> void:
 
 
 func _finalize_throw() -> void:
+	# Mode/step are captured BEFORE dispatch: a throw that completes
+	# enrollment flips `enrolling` off, and the record must say what the
+	# throw WAS, not what the state became.
+	var rec_mode: String = "enroll" if enrolling else ("free" if templates.has("FB") and templates.has("CB") else "pre_enrollment")
+	var rec_step: String = ""
+	if enrolling and enroll_idx < enroll_queue.size():
+		rec_step = String(enroll_queue[enroll_idx])
 	if ring.size() < 8:
+		# Too short to judge - still an attempt, still recorded (the raw
+		# ring as held; there are no trimmed samples or features to log).
+		var few_feats := PackedFloat32Array()
+		var few_speed: float = -1.0
+		if not ring.is_empty():
+			var last_s: Dictionary = ring[ring.size() - 1]
+			var last_lv: Vector3 = last_s["lv"]
+			few_speed = last_lv.length()
+			few_feats = ThrowFeatures.extract_features(ring)
+		_record_throw_attempt(ring, few_feats, few_speed, Vector3.ZERO, false,
+			rec_mode, rec_step, "rejected", "too_few_samples", {})
 		return
 	# Trim the windup lead-in, keep a short tail before the delivery.
 	var d0: int = ThrowFeatures.delivery_start_index(ring)
@@ -989,8 +1040,16 @@ func _finalize_throw() -> void:
 	var rel_lv: Vector3 = release["lv"]
 	var rel_pos: Vector3 = release["p"]
 	var speed: float = rel_lv.length()
+	# The intent direction is computed once and used for BOTH the plate
+	# sanity check below and the recorder (their divergence from the
+	# release-frame direction is a key offline measurement). Computing
+	# features for a rejected throw is measurement only - it feeds no
+	# decision the original flow didn't already make.
+	var intent_dir: Vector3 = ThrowFeatures.release_intent_dir(samples)
 	if speed < 1.5:
 		last_result = "That throw was too soft to read (%.1f m/s). Throw it like you mean it." % speed
+		_record_throw_attempt(samples, ThrowFeatures.extract_features(samples), speed,
+			intent_dir, true, rec_mode, rec_step, "rejected", "too_soft", {})
 		_refresh_ui()
 		return
 	var to_plate: Vector3 = (PLATE_POS + Vector3(0.0, 0.9, 0.0) - rel_pos).normalized()
@@ -998,19 +1057,219 @@ func _finalize_throw() -> void:
 	# not the grip-release frame's velocity: the button lets go during
 	# follow-through, when the hand has already turned - judging the throw
 	# by that frame is what made aim feel like darts (seventh pass).
-	if ThrowFeatures.release_intent_dir(samples).dot(to_plate) < 0.25:
+	if intent_dir.dot(to_plate) < 0.25:
 		last_result = "That one wasn't toward the plate - not counted."
+		_record_throw_attempt(samples, ThrowFeatures.extract_features(samples), speed,
+			intent_dir, true, rec_mode, rec_step, "rejected", "not_toward_plate", {})
 		_refresh_ui()
 		return
 	var features: PackedFloat32Array = ThrowFeatures.extract_features(samples)
+	var detail: Dictionary = {"enroll": null, "verdict": null, "flight": null}
 	if enrolling:
-		_enrollment_throw(features, speed, samples)
+		var eo: Dictionary = _enrollment_throw(features, speed, samples)
+		var e_meta: Dictionary = eo["flight_meta"]
+		detail["enroll"] = {
+			"step": String(eo["step"]), "count": int(eo["count"]),
+			"target": int(eo["target"]), "completed": bool(eo["completed"]),
+			"avg_speed": eo["avg_speed"],
+		}
+		detail["flight"] = _flight_record(e_meta)
 	else:
-		_free_throw(features, speed, samples)
+		var fo: Dictionary = _free_throw(features, speed, samples)
+		var f_meta: Dictionary = fo["flight_meta"]
+		detail["flight"] = _flight_record(f_meta)
+		if bool(fo["classified"]):
+			var dists: Dictionary = {}
+			var raw_dists: Dictionary = fo["distances"]
+			for dk: String in raw_dists.keys():
+				dists[dk] = float(raw_dists[dk])
+			var cross_v: Variant = f_meta.get("cross_pos")
+			detail["verdict"] = {
+				"pitch": String(fo["pitch"]), "confidence": float(fo["confidence"]),
+				"distances": dists, "mph": float(fo["mph"]), "gear": String(fo["gear"]),
+				"plate_cross": _vec3_arr(cross_v) if cross_v is Vector3 else null,
+				"plate_crossed": bool(f_meta.get("crossed", false)),
+				"call": _call_for_flight(f_meta),
+			}
+	_record_throw_attempt(samples, features, speed, intent_dir, true,
+		rec_mode, rec_step, "accepted", "", detail)
 	_refresh_ui()
 
 
-func _enrollment_throw(features: PackedFloat32Array, speed: float, samples: Array) -> void:
+# ---------------------------------------------------------------- throw recorder (eighth pass)
+## Measurement only. One JSON object per line in THROW_LOG_PATH for every
+## attempt that reaches _finalize_throw, accepted or rejected, holding
+## everything needed to replay the throw offline: the trimmed samples as
+## fed to feature extraction (grip included), the labeled feature
+## vector, BOTH candidate release directions (intent vs the button's
+## release frame), the outcome, and a snapshot of the templates and
+## calibration state as they stood AFTER the throw was processed - so
+## each record is self-contained. Recording must never break a throw:
+## every IO step null-checks and a failure only flags the panel line.
+
+func _init_throw_log() -> void:
+	throw_log_abs_path = ProjectSettings.globalize_path(THROW_LOG_PATH)
+	throws_recorded = 0
+	if FileAccess.file_exists(THROW_LOG_PATH):
+		var f := FileAccess.open(THROW_LOG_PATH, FileAccess.READ)
+		if f != null:
+			while not f.eof_reached():
+				if f.get_line().strip_edges() != "":
+					throws_recorded += 1
+			f.close()
+
+
+func _on_clear_throw_log() -> void:
+	var f := FileAccess.open(THROW_LOG_PATH, FileAccess.WRITE)
+	if f != null:
+		f.close()
+		throws_recorded = 0
+		throw_log_failed = false
+		last_result = "Throw log cleared - recording fresh."
+	else:
+		throw_log_failed = true
+	_play_click()
+	_refresh_ui()
+
+
+func _record_throw_attempt(samples: Array, features: PackedFloat32Array, speed: float, intent_dir: Vector3, has_intent: bool, mode_str: String, step_str: String, outcome_str: String, reason: String, detail: Dictionary) -> void:
+	var rec: Dictionary = {}
+	rec["v"] = 1
+	rec["seq"] = throws_recorded + 1
+	rec["ts"] = Time.get_datetime_string_from_system()
+	rec["ts_unix"] = Time.get_unix_time_from_system()
+	rec["mode"] = mode_str
+	rec["enroll_step"] = step_str
+	rec["hand"] = throwing_hand
+	rec["posture"] = posture
+	rec["samples"] = _serialize_samples(samples)
+	rec["sample_count"] = samples.size()
+	if features.size() == ThrowFeatures.FEATURE_COUNT:
+		rec["features"] = ThrowFeatures.labeled_features(features)
+		var raw_feats: Array = []
+		for fv: float in features:
+			raw_feats.append(fv)
+		rec["features_raw"] = raw_feats
+	else:
+		rec["features"] = null
+		rec["features_raw"] = null
+	rec["release_speed_mps"] = speed
+	var rel_dir: Vector3 = Vector3.ZERO
+	var has_rel_dir: bool = false
+	if samples.is_empty():
+		rec["release_pos"] = null
+		rec["release_frame_dir"] = null
+	else:
+		var rel: Dictionary = samples[samples.size() - 1]
+		var rp: Vector3 = rel["p"]
+		var rlv: Vector3 = rel["lv"]
+		rec["release_pos"] = [rp.x, rp.y, rp.z]
+		if rlv.length() > 0.01:
+			rel_dir = rlv.normalized()
+			has_rel_dir = true
+			rec["release_frame_dir"] = [rel_dir.x, rel_dir.y, rel_dir.z]
+		else:
+			rec["release_frame_dir"] = null
+	rec["intent_dir"] = [intent_dir.x, intent_dir.y, intent_dir.z] if has_intent else null
+	rec["intent_vs_release_deg"] = rad_to_deg(intent_dir.angle_to(rel_dir)) if has_intent and has_rel_dir else null
+	rec["outcome"] = outcome_str
+	rec["reason"] = reason
+	rec["reason_text"] = last_result
+	rec["enroll"] = detail.get("enroll")
+	rec["verdict"] = detail.get("verdict")
+	rec["flight"] = detail.get("flight")
+	rec["state"] = {
+		"calib_max": calib_max, "fast_anchor": fast_anchor,
+		"med_anchor": med_anchor, "boost_mult": boost_mult,
+		"templates": _templates_snapshot(),
+	}
+	_append_throw_record(rec)
+
+
+func _append_throw_record(rec: Dictionary) -> void:
+	var f := FileAccess.open(THROW_LOG_PATH, FileAccess.READ_WRITE)
+	if f == null:
+		# READ_WRITE won't create a missing file; WRITE will.
+		f = FileAccess.open(THROW_LOG_PATH, FileAccess.WRITE)
+	if f == null:
+		throw_log_failed = true
+		return
+	f.seek_end()
+	f.store_line(JSON.stringify(rec))
+	f.flush()
+	f.close()
+	throws_recorded += 1
+
+
+func _serialize_samples(samples: Array) -> Array:
+	var out: Array = []
+	for raw: Variant in samples:
+		var s: Dictionary = raw
+		var p: Vector3 = s["p"]
+		var lv: Vector3 = s["lv"]
+		var av_v: Variant = s.get("av", Vector3.ZERO)
+		var av: Vector3 = av_v if av_v is Vector3 else Vector3.ZERO
+		var q_v: Variant = s.get("q", Quaternion.IDENTITY)
+		var q: Quaternion = q_v if q_v is Quaternion else Quaternion.IDENTITY
+		out.append({
+			"t": float(s["t"]),
+			"p": [p.x, p.y, p.z],
+			"lv": [lv.x, lv.y, lv.z],
+			"av": [av.x, av.y, av.z],
+			"q": [q.x, q.y, q.z, q.w],
+			"grip": float(s.get("grip", 0.0)),
+		})
+	return out
+
+
+func _templates_snapshot() -> Dictionary:
+	var snap: Dictionary = {}
+	for pitch: String in templates.keys():
+		var tpl: Dictionary = templates[pitch]
+		var tf: PackedFloat32Array = tpl["features"]
+		var entry: Dictionary = {
+			"features": ThrowFeatures.labeled_features(tf),
+			"spread": float(tpl.get("spread", 0.0)),
+		}
+		if tpl.has("cue"):
+			entry["cue"] = String(tpl["cue"])
+		snap[pitch] = entry
+	return snap
+
+
+func _vec3_arr(v: Vector3) -> Array:
+	return [v.x, v.y, v.z]
+
+
+func _flight_record(meta: Dictionary) -> Dictionary:
+	if meta.is_empty():
+		return {}
+	var cp_v: Variant = meta.get("cross_pos", Vector3.ZERO)
+	var cp: Vector3 = cp_v if cp_v is Vector3 else Vector3.ZERO
+	return {
+		"pitch": String(meta.get("pitch", "")),
+		"mph": float(meta.get("mph", 0.0)),
+		"crossed": bool(meta.get("crossed", false)),
+		"cross_pos": [cp.x, cp.y, cp.z],
+	}
+
+
+## The umpire's call for a flight, computed exactly as _announce computes
+## it from the same meta - duplicated here so the record carries the
+## call at throw time instead of whenever the ball reaches the plate.
+func _call_for_flight(meta: Dictionary) -> String:
+	if not bool(meta.get("crossed", false)):
+		return "NO PLATE"
+	var cp_v: Variant = meta.get("cross_pos", Vector3.ZERO)
+	var cp: Vector3 = cp_v if cp_v is Vector3 else Vector3.ZERO
+	var in_zone: bool = absf(cp.x) <= ZONE_HALF_W + BALL_R and cp.y >= zone_bottom - BALL_R and cp.y <= zone_top + BALL_R
+	return "STRIKE" if in_zone else "BALL"
+
+
+## Returns an outcome Dictionary for the throw recorder: step, counted
+## index/target, whether the step completed, its average speed, and the
+## visual flight's meta. Behavior unchanged.
+func _enrollment_throw(features: PackedFloat32Array, speed: float, samples: Array) -> Dictionary:
 	var step: String = enroll_queue[enroll_idx]
 	step_features.append(features)
 	step_speeds.append(speed)
@@ -1019,12 +1278,16 @@ func _enrollment_throw(features: PackedFloat32Array, speed: float, samples: Arra
 	# cannot watch feels broken even when the counter ticks. Enrollment
 	# flights are "quiet": no gun-board post, no PB, the panel counting text
 	# below stays the feedback channel. (Sixth pass, Chris's field report.)
-	_spawn_visual_flight(samples, features, _enrollment_flight_pitch(step))
+	var flight_meta: Dictionary = _spawn_visual_flight(samples, features, _enrollment_flight_pitch(step))
 	last_result = "Counted: %.2f m/s (%d mph raw)." % [speed, int(round(speed * ThrowFeatures.MPH_PER_MPS))]
 	if step == "calib" and calib_max <= 0.01:
 		last_result += " The ball still flies, but that is visual only - the gun stays dark until calibration lands."
+	var outcome: Dictionary = {
+		"step": step, "count": step_speeds.size(), "target": _step_target_count(),
+		"completed": false, "avg_speed": null, "flight_meta": flight_meta,
+	}
 	if step_speeds.size() < _step_target_count():
-		return
+		return outcome
 	var avg_speed: float = 0.0
 	for s: float in step_speeds:
 		avg_speed += s
@@ -1053,7 +1316,10 @@ func _enrollment_throw(features: PackedFloat32Array, speed: float, samples: Arra
 		"gear_med":
 			med_anchor = avg_speed
 			last_result = "MEDIUM gear anchored at %.2f m/s." % med_anchor
+	outcome["completed"] = true
+	outcome["avg_speed"] = avg_speed
 	_advance_step()
+	return outcome
 
 
 ## The flight character an enrollment step throws with: calibration and
@@ -1075,7 +1341,7 @@ func _enrollment_flight_pitch(step: String) -> String:
 ## the ball leaves at a believable pace and never looks lobbed. The flight
 ## is flagged "quiet" - _update_flights will not announce it on the gun
 ## board, record a PB, or overwrite the panel's result text.
-func _spawn_visual_flight(samples: Array, features: PackedFloat32Array, pitch: String) -> void:
+func _spawn_visual_flight(samples: Array, features: PackedFloat32Array, pitch: String) -> Dictionary:
 	var release: Dictionary = samples[samples.size() - 1]
 	var rel_pos: Vector3 = release["p"]
 	var rel_lv: Vector3 = release["lv"]
@@ -1089,19 +1355,22 @@ func _spawn_visual_flight(samples: Array, features: PackedFloat32Array, pitch: S
 	var spin: Dictionary = ThrowFeatures.spin_params(pitch, ThrowFeatures.roll01_from_features(features))
 	# Flight direction = the arm's intent (peak-speed window), never the
 	# grip-release frame - see release_intent_dir.
-	_start_flight(rel_pos, ThrowFeatures.release_intent_dir(samples), mph, pitch, spin["axis"], float(spin["rate"]), {
+	return _start_flight(rel_pos, ThrowFeatures.release_intent_dir(samples), mph, pitch, spin["axis"], float(spin["rate"]), {
 		"quiet": true, "watch": false,
 	})
 
 
-func _free_throw(features: PackedFloat32Array, speed: float, samples: Array) -> void:
+## Returns an outcome Dictionary for the throw recorder: whether the
+## throw was classified, the verdict when it was, and the flight's meta.
+## Behavior unchanged.
+func _free_throw(features: PackedFloat32Array, speed: float, samples: Array) -> Dictionary:
 	if not (templates.has("FB") and templates.has("CB")):
 		# No templates yet: the throw still flies as an unclassified "just a
 		# throw" at provisionally mapped speed - a new player who ignores the
 		# panel and throws sees a ball go. Gun board stays dark (quiet).
-		_spawn_visual_flight(samples, features, "FB")
+		var stray_meta: Dictionary = _spawn_visual_flight(samples, features, "FB")
 		last_result = "Enroll a fastball and a curveball first - then the gun goes live."
-		return
+		return {"classified": false, "flight_meta": stray_meta}
 	# Sandbag guard (per spec): beating your calibrated max re-anchors it.
 	if calib_max > 0.01 and speed > calib_max:
 		calib_max = speed
@@ -1120,20 +1389,28 @@ func _free_throw(features: PackedFloat32Array, speed: float, samples: Array) -> 
 	# Flight direction = release intent (peak-speed window). Speed still
 	# comes from the release sample via the caller's `speed` - magnitude
 	# semantics unchanged, only the direction stopped trusting the button.
-	_start_flight(rel_pos, ThrowFeatures.release_intent_dir(samples), mph, pitch, axis, float(spin["rate"]), {
+	var flight_meta: Dictionary = _start_flight(rel_pos, ThrowFeatures.release_intent_dir(samples), mph, pitch, axis, float(spin["rate"]), {
 		"confidence": confidence, "gear": gear, "watch": false,
 	})
 	release_player.play()
+	return {
+		"classified": true, "pitch": pitch, "confidence": confidence,
+		"distances": verdict["distances"], "mph": mph, "gear": gear,
+		"flight_meta": flight_meta,
+	}
 
 
 # ---------------------------------------------------------------- flight playback
 
-func _start_flight(start: Vector3, dir: Vector3, mph: float, pitch: String, spin_axis: Vector3, spin_rate: float, meta: Dictionary) -> void:
+## Returns the flight's full meta (pitch/mph/plate crossing included) so
+## callers - the throw recorder - can log where the pitch actually went.
+## Empty Dictionary when the flight could not be simulated.
+func _start_flight(start: Vector3, dir: Vector3, mph: float, pitch: String, spin_axis: Vector3, spin_rate: float, meta: Dictionary) -> Dictionary:
 	var speed_mps: float = mph / ThrowFeatures.MPH_PER_MPS
 	var flight: Dictionary = ThrowFeatures.simulate_flight(start, dir * speed_mps, spin_axis, spin_rate)
 	var points: PackedVector3Array = flight["points"]
 	if points.size() < 2:
-		return
+		return {}
 	var mesh := SphereMesh.new()
 	mesh.radius = BALL_R
 	mesh.height = BALL_R * 2.0
@@ -1151,6 +1428,7 @@ func _start_flight(start: Vector3, dir: Vector3, mph: float, pitch: String, spin
 		"node": ball, "points": points, "elapsed": 0.0,
 		"total": float(flight["time"]), "meta": full_meta, "announced": false,
 	})
+	return full_meta
 
 
 func _process(delta: float) -> void:

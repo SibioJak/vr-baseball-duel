@@ -136,6 +136,57 @@ func _run() -> void:
 	check(main.last_result.begins_with("Gun:"), "gun announced the pitch (%s)" % main.last_result)
 	check(main.pbs.has("FB"), "personal best recorded")
 
+	# Throw recorder (eighth pass): every attempt through _finalize_throw
+	# lands in user://throws.jsonl - accepted with verdict, rejected with
+	# reason - and Clear truncates.
+	main._on_clear_throw_log()
+	check(main.throws_recorded == 0, "recorder: clear resets the count")
+	var rec_motion: Array = make_motion(7.9, false)
+	main.ring = rec_motion.duplicate()
+	main._finalize_throw()
+	check(main.throws_recorded == 1, "recorder: accepted free throw appended a record")
+	var log_lines: Array = FileAccess.get_file_as_string("user://throws.jsonl").split("\n", false)
+	check(log_lines.size() == 1, "recorder: one JSONL line on disk")
+	var parsed: Variant = JSON.parse_string(log_lines[0]) if log_lines.size() == 1 else null
+	check(parsed is Dictionary, "recorder: record parses as JSON")
+	if parsed is Dictionary:
+		var rec: Dictionary = parsed
+		var rec_samples: Variant = rec.get("samples")
+		check(rec_samples is Array and (rec_samples as Array).size() >= 20,
+			"recorder: trimmed samples embedded (%s)" % (str((rec_samples as Array).size()) if rec_samples is Array else "none"))
+		var rec_feats: Variant = rec.get("features")
+		check(rec_feats is Dictionary and (rec_feats as Dictionary).size() == 15,
+			"recorder: 15 labeled features")
+		var rec_intent: Variant = rec.get("intent_dir")
+		var rec_frame: Variant = rec.get("release_frame_dir")
+		check(rec_intent is Array and (rec_intent as Array).size() == 3
+			and rec_frame is Array and (rec_frame as Array).size() == 3,
+			"recorder: intent + release-frame directions both kept")
+		var rec_verdict: Variant = rec.get("verdict")
+		check(rec_verdict is Dictionary and String((rec_verdict as Dictionary).get("pitch", "")) == "FB",
+			"recorder: verdict recorded (FB)")
+		check(rec_verdict is Dictionary and (rec_verdict as Dictionary).has("call")
+			and (rec_verdict as Dictionary).has("plate_cross"),
+			"recorder: plate crossing + call recorded")
+		check(String(rec.get("outcome", "")) == "accepted", "recorder: outcome accepted")
+	var soft: Array = []
+	for si: int in 20:
+		soft.append(ThrowFeatures.make_sample(float(si) / 90.0, Vector3(0.2, 1.4, 0.3), Vector3(0.0, 0.0, -0.5), Vector3.ZERO))
+	main.ring = soft
+	main._finalize_throw()
+	check(main.throws_recorded == 2, "recorder: rejected throw appended too")
+	var log_lines2: Array = FileAccess.get_file_as_string("user://throws.jsonl").split("\n", false)
+	var parsed2: Variant = JSON.parse_string(log_lines2[log_lines2.size() - 1]) if not log_lines2.is_empty() else null
+	check(parsed2 is Dictionary and String((parsed2 as Dictionary).get("outcome", "")) == "rejected"
+		and String((parsed2 as Dictionary).get("reason", "")) == "too_soft",
+		"recorder: rejection carries its reason (too_soft)")
+	main._on_clear_throw_log()
+	check(main.throws_recorded == 0 and FileAccess.get_file_as_string("user://throws.jsonl").strip_edges() == "",
+		"recorder: clear truncates the log")
+	main.ring = rec_motion.duplicate()
+	main._finalize_throw()
+	check(main.throws_recorded == 1, "recorder: recording resumes after clear")
+
 	# Watch mode: AI replays the enrolled motion, retimed.
 	main._set_mode(2) # Mode.WATCH
 	main._on_throw_it()
