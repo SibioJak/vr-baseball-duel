@@ -1372,12 +1372,17 @@ func _record_throw_attempt(samples: Array, features: PackedFloat32Array, speed: 
 		rec["aim_cross"] = _vec3_arr(ac_v) if ac_v is Vector3 else null
 		rec["scatter_k"] = float(aim_d.get("scatter_k", scatter_k))
 		rec["gaze_calibrated"] = bool(aim_d.get("gaze_calibrated", gaze_calibrated))
+		# Thirteenth pass: the aim solver's final error (m) against
+		# the aim point it was asked for - null on the no-head path.
+		var se_v: Variant = aim_d.get("solver_error_m", null)
+		rec["solver_error_m"] = float(se_v) if se_v is float or se_v is int else null
 	else:
 		rec["head_cross_raw"] = null
 		rec["target_cross"] = null
 		rec["aim_cross"] = null
 		rec["scatter_k"] = scatter_k
 		rec["gaze_calibrated"] = gaze_calibrated
+		rec["solver_error_m"] = null
 	rec["outcome"] = outcome_str
 	rec["reason"] = reason
 	rec["reason_text"] = last_result
@@ -1620,12 +1625,32 @@ func _compute_aim(samples: Array, rel_pos: Vector3, mph: float, spin_axis: Vecto
 	if bool(intent_cross_d["crossed"]):
 		intent_cross = intent_cross_d["cross"]
 	var aim_pt: Vector3 = ThrowFeatures.aim_cross(target, intent_cross, scatter_k)
+	# Thirteenth pass: clamp the leaked aim into the reachable band -
+	# a pitch cannot cross the plate below ground, and a below-ground
+	# aim is what made the old solver give up on ordinary head targets
+	# (session 4, throws #50/#57/#59). The scatter formula itself is
+	# untouched; only the impossible tail is cut.
+	aim_pt.y = maxf(aim_pt.y, 0.0)
 	var solved: Dictionary = ThrowFeatures.solve_aim_dir(rel_pos, mph / ThrowFeatures.MPH_PER_MPS, spin_axis, spin_rate, aim_pt)
 	if not bool(solved["crossed"]):
-		return {}
+		# Final guard (thirteenth pass): never abandon head aim over
+		# solver trouble. Fall back to aiming at the (clamped) target
+		# T itself; if even that somehow does not cross, the primary
+		# attempt's direction still flies below - a head-derived
+		# launch, never the raw hand-intent path, while a head
+		# target exists.
+		var fb_target := Vector3(target.x, maxf(target.y, 0.0), target.z)
+		var solved_fb: Dictionary = ThrowFeatures.solve_aim_dir(rel_pos, mph / ThrowFeatures.MPH_PER_MPS, spin_axis, spin_rate, fb_target)
+		if bool(solved_fb["crossed"]):
+			aim_pt = fb_target
+			solved = solved_fb
 	var pub: Dictionary = {
 		"target_cross": target, "aim_cross": aim_pt,
 		"scatter_k": scatter_k, "gaze_calibrated": gaze_calibrated,
+		# Thirteenth pass: the solver's final error against the aim
+		# rides in every record that carries an aim, so a future
+		# field miss shows whether the solver or the model missed.
+		"solver_error_m": float(solved["error_m"]),
 	}
 	if bool(raw_cross_d["crossed"]):
 		var rc: Vector3 = raw_cross_d["cross"]

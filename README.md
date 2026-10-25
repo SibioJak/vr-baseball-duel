@@ -57,7 +57,14 @@ that's the failure mode, not the test.
    to your look, a sloppy one leaks. The launch is drop-compensated
    against the flight sim, so the ball crosses where it was aimed. If a
    throw somehow carries no head data, it falls back to the old
-   peak-speed-window arm direction, unchanged.
+   peak-speed-window arm direction, unchanged. The launch solver
+   (thirteenth pass) iterates until the simulated cross is within
+   0.02 m of the aim point; the aim point is clamped so it can't sit
+   below ground at the plate (a low leak used to aim into the dirt,
+   the old solver gave up, and the throw fell back to the hand path —
+   session 4 lost 3 of 13 throws that way). If the solver still can't
+   land the leaked aim, it aims at your look target itself rather
+   than ever dropping back to the hand path while head data exists.
    - **Fastball only, for now (ninth pass):** enrollment is the fastball
      and its gears, and free throw treats every throw as a fastball — the
      classifier isn't consulted until a curveball exists. The curveball
@@ -158,7 +165,9 @@ sound beyond two tiny UI blips (no loops — nothing can play after close).
   stability). The eleventh pass rebuilt aim on the head line (see
   "What to do in the headset"); the throw recorder is now v3 and logs
   the aim decomposition per throw (raw head cross, corrected target,
-  final aim cross, scatter k, gaze flag) beside the achieved cross.
+  final aim cross, scatter k, gaze flag — and, thirteenth pass, the
+  aim solver's final error `solver_error_m`, so a field miss shows
+  whether the solver or the model missed) beside the achieved cross.
   Hand aim survives only as the fallback for a throw with no head
   data — and as the leak the Scatter slider meters.
 
@@ -214,6 +223,21 @@ Headless, with the real Godot 4.7 binary:
   records null aim fields), and the v2→v3 profile upgrade (templates
   SURVIVE — no vector changed — gaze loads uncalibrated with a Re-gaze
   suggestion; scatter round-trips). All pass.
+- `tests/solver_aim.gd` — 20 checks (thirteenth pass): the aim
+  solver against session 4's field cases, replayed exactly — throw
+  #51 (pre-fix solver error 1.07 m; now 0.000 m against the clamped
+  aim) and throws #50/#57/#59, whose below-ground leaked aims never
+  crossed pre-fix (now ≤ 0.013 m) — plus a 175-case verification grid
+  (aim x −0.5…2.5, y 0.0…1.8, 39–96 mph, FB spin: every case crosses,
+  max solver error 0.0198 m), a determinism check, and an end-to-end
+  `_compute_aim` case in the #50 shape (head target survives a
+  below-ground leaked aim; the public block carries
+  `solver_error_m`). The new behaviour: refine to a 0.02 m tolerance
+  (cap 6), recover from a dirt landing by searching the raise
+  (doubling + bisection of the crossing band), clamp the aim/target
+  at plate height 0.0, and never abandon head aim over solver
+  trouble (final guard: aim at the clamped target itself). The test
+  fails 15 of 20 checks on the pre-fix code (negative control).
 - `tests/gaze_field_path.gd` — 27 checks (twelfth pass): the gaze
   pipeline end to end through the REAL field path — real dwell
   captures on a synthetic biased head, profile save, fresh load, real

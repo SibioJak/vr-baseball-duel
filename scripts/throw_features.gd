@@ -743,15 +743,53 @@ static func gaze_correction_fit(captures: Array) -> Dictionary:
 	return out
 
 
+## Solver tolerance + refinement cap (thirteenth pass): iterate the
+## cross-error refinement until the simulated cross is within
+## SOLVE_TOL_M of the target, or SOLVE_MAX_ITER refinements have run.
+## The dirt-recovery search inside one refinement (doubling raises +
+## a bisection of the crossing band) is separately bounded and does
+## not consume refinements. Deterministic throughout: same inputs,
+## same answer, so tests can pin the accuracy.
+const SOLVE_TOL_M: float = 0.02
+const SOLVE_MAX_ITER: int = 6
+
+
+## One solver evaluation: the launch direction at `aim_point` and the
+## SIMULATED flight it produces. "ok" is false only when the aim point
+## sits on top of the start (no direction exists).
+static func _solve_eval(start: Vector3, speed_mps: float, spin_axis: Vector3, spin_rate: float, aim_point: Vector3) -> Dictionary:
+	var to_aim: Vector3 = aim_point - start
+	if to_aim.length() < 0.01:
+		return {"ok": false, "dir": Vector3(0.0, 0.0, -1.0), "crossed": false, "cross": start}
+	var dir: Vector3 = to_aim.normalized()
+	var flight: Dictionary = simulate_flight(start, dir * speed_mps, spin_axis, spin_rate)
+	return {"ok": true, "dir": dir, "crossed": bool(flight["crossed"]), "cross": flight["cross_pos"]}
+
+
 ## Solve the launch direction whose SIMULATED flight crosses the plate
 ## plane at `target` (a plate-plane point, z = PLATE_Z), for a ball
 ## leaving `start` at `speed_mps` with the given spin. Start from the
 ## direction at the target raised by the no-Magnus gravity drop for the
-## flight time, simulate, then ONE refinement: shift the aim point by
-## the full cross error (vertical AND lateral - the curve's Magnus
-## drift is lateral too) and re-derive. Returns the final direction,
-## the achieved cross, and the miss distance. Deterministic: same
-## inputs, same answer, so tests can pin the accuracy.
+## flight time, simulate, then refine: shift the aim point by the full
+## cross error (vertical AND lateral - the curve's Magnus drift is
+## lateral too) and re-derive, until the cross is within SOLVE_TOL_M
+## or the refinement cap is hit; the best crossing seen is returned.
+##
+## ROBUST (thirteenth pass): the pre-fix solver ran exactly 2
+## iterations, recovered from a dirt landing with a flat +1.0 m raise,
+## and the caller accepted any crossing - session 4's throw #51 wore
+## a solver error of 1.08 m, and throws #50/#57/#59 (leaked aim points
+## below ground) never crossed at all. Two changes fix that shape:
+## (1) the target is CLAMPED into the reachable band first - a pitch
+## cannot cross the plate below ground, so target.y is raised to a
+## minimum of 0.0 (the error returned is against the clamped target);
+## (2) when a simulated flight does NOT cross (lands short / in the
+## dirt), the recovery SEARCHES the raise instead of guessing one:
+## progressively larger raises (0.25 m, doubling) until a flight
+## crosses, then a bisection of the band between the last failing aim
+## and the first crossing aim, which lands on the lowest crossing aim
+## - the one nearest the wanted cross height when the target sits at
+## the ground boundary. Refinement then resumes normally.
 static func solve_aim_dir(start: Vector3, speed_mps: float, spin_axis: Vector3, spin_rate: float, target: Vector3) -> Dictionary:
 	var out: Dictionary = {
 		"dir": Vector3(0.0, 0.0, -1.0), "cross_pos": start,
@@ -759,37 +797,68 @@ static func solve_aim_dir(start: Vector3, speed_mps: float, spin_axis: Vector3, 
 	}
 	if speed_mps < 0.5:
 		return out
-	var dz: float = maxf(start.z - target.z, 1.0)
+	var clamped := Vector3(target.x, maxf(target.y, 0.0), target.z)
+	var dz: float = maxf(start.z - clamped.z, 1.0)
 	var t_est: float = dz / speed_mps
-	var aim_point: Vector3 = target + Vector3(0.0, 0.5 * GRAVITY * t_est * t_est, 0.0)
+	var aim_point: Vector3 = clamped + Vector3(0.0, 0.5 * GRAVITY * t_est * t_est, 0.0)
 	var best_dir: Vector3 = Vector3(0.0, 0.0, -1.0)
 	var best_cross: Vector3 = start
 	var best_crossed: bool = false
 	var best_err: float = -1.0
-	for iteration: int in 2:
-		var to_aim: Vector3 = aim_point - start
-		if to_aim.length() < 0.01:
+	var last_dir: Vector3 = Vector3(0.0, 0.0, -1.0)
+	for iteration: int in SOLVE_MAX_ITER:
+		var ev: Dictionary = _solve_eval(start, speed_mps, spin_axis, spin_rate, aim_point)
+		if not bool(ev["ok"]):
 			break
-		var dir: Vector3 = to_aim.normalized()
-		var flight: Dictionary = simulate_flight(start, dir * speed_mps, spin_axis, spin_rate)
-		var crossed: bool = bool(flight["crossed"])
-		var cross: Vector3 = flight["cross_pos"]
-		var err: float = Vector2(target.x - cross.x, target.y - cross.y).length()
-		best_dir = dir
-		best_cross = cross
-		best_crossed = crossed
-		best_err = err
-		if iteration == 0:
-			if crossed:
-				aim_point += Vector3(target.x - cross.x, target.y - cross.y, 0.0)
-			else:
-				# Ball landed short of the plane (in the dirt): raise the
-				# aim and let the refinement iteration try again.
-				aim_point += Vector3(0.0, 1.0, 0.0)
-	out["dir"] = best_dir
-	out["cross_pos"] = best_cross
-	out["crossed"] = best_crossed
-	out["error_m"] = best_err
+		var dir: Vector3 = ev["dir"]
+		last_dir = dir
+		if bool(ev["crossed"]):
+			var cross: Vector3 = ev["cross"]
+			var err: float = Vector2(clamped.x - cross.x, clamped.y - cross.y).length()
+			if not best_crossed or err < best_err:
+				best_dir = dir
+				best_cross = cross
+				best_crossed = true
+				best_err = err
+			if err <= SOLVE_TOL_M:
+				break
+			aim_point += Vector3(clamped.x - cross.x, clamped.y - cross.y, 0.0)
+		else:
+			# Ball landed short of the plane (in the dirt): search the
+			# raise - double it until a flight crosses, then bisect the
+			# band down to the lowest crossing aim and resume refining.
+			var fail_aim: Vector3 = aim_point
+			var hi_aim: Vector3 = fail_aim
+			var found_cross: bool = false
+			var raise_amt: float = 0.25
+			for s: int in 8:
+				var trial: Vector3 = fail_aim + Vector3(0.0, raise_amt, 0.0)
+				var ev2: Dictionary = _solve_eval(start, speed_mps, spin_axis, spin_rate, trial)
+				if bool(ev2["ok"]) and bool(ev2["crossed"]):
+					hi_aim = trial
+					found_cross = true
+					break
+				raise_amt *= 2.0
+			if not found_cross:
+				break
+			var lo_aim: Vector3 = fail_aim
+			for b: int in 8:
+				var mid := Vector3(lo_aim.x, (lo_aim.y + hi_aim.y) * 0.5, lo_aim.z)
+				var ev3: Dictionary = _solve_eval(start, speed_mps, spin_axis, spin_rate, mid)
+				if bool(ev3["ok"]) and bool(ev3["crossed"]):
+					hi_aim = mid
+				else:
+					lo_aim = mid
+			aim_point = hi_aim
+	if best_crossed:
+		out["dir"] = best_dir
+		out["cross_pos"] = best_cross
+		out["crossed"] = true
+		out["error_m"] = best_err
+	else:
+		# Never crossed at all: hand back the last direction tried so
+		# the caller still gets a head-derived launch, not silence.
+		out["dir"] = last_dir
 	return out
 
 
