@@ -94,6 +94,24 @@ func _run() -> void:
 		(f["node"] as Node).queue_free()
 	main.flights.clear()
 
+	# Gaze dwell (eleventh pass): capture is by head stillness alone -
+	# a wandering head must NEVER capture, a still one captures each
+	# target in turn and the step fits the correction by itself.
+	main._start_enrollment(["gaze"])
+	check(main.gaze_root.visible, "gaze targets show on the gaze step")
+	for wi: int in 30:
+		var yaw: float = deg_to_rad(3.0) if wi % 2 == 0 else deg_to_rad(-3.0)
+		main.cam.transform = Transform3D(Basis.from_euler(Vector3(0.0, yaw, 0.0)), Vector3.ZERO)
+		main._update_gaze(0.1)
+	check(main.gaze_idx == 0, "gaze dwell does NOT capture a wandering head (idx %d)" % main.gaze_idx)
+	main.cam.transform = Transform3D.IDENTITY
+	for si: int in 40:
+		main._update_gaze(0.1)
+	check(main.gaze_idx >= 5, "gaze dwell captures all five targets on a still head")
+	check(main.gaze_calibrated, "gaze step fitted + stored the correction")
+	check(not main.enrolling, "gaze-only enrollment completes after the fifth capture")
+	check(not main.gaze_root.visible, "gaze targets hide when the gaze step ends")
+
 	# CB cue flow (seventh pass): the cue picker and the ghost arm exist
 	# only on the curveball step; the picked picture is stored with the
 	# CB template. Drive a CB-only enrollment first.
@@ -115,10 +133,16 @@ func _run() -> void:
 	# these verdicts fb_only so they are never read as classifications.
 	main._on_wipe()
 	main._on_begin()
-	check(main.enroll_queue.size() == 4 and String(main.enroll_queue[0]) == "calib"
-		and String(main.enroll_queue[1]) == "fb"
+	check(main.enroll_queue.size() == 5 and String(main.enroll_queue[0]) == "gaze"
+		and String(main.enroll_queue[1]) == "calib"
+		and String(main.enroll_queue[2]) == "fb"
 		and not main.enroll_queue.has("cb") and not main.enroll_queue.has("p3"),
-		"default enrollment is fastball-only (calib, fb, gears)")
+		"default enrollment is gaze + fastball-only (gaze, calib, fb, gears)")
+	# The still headless camera captures the gaze step by dwell.
+	for gi: int in 40:
+		main._update_gaze(0.1)
+	check(main.gaze_calibrated and String(main.enroll_queue[main.enroll_idx]) == "calib",
+		"gaze step completes by dwell and hands off to calibration")
 	feed(main, false, 8.0, 3) # calib
 	feed(main, false, 8.1, 3) # fb
 	feed(main, false, 8.05, 3) # gear fast (3 throws, median anchor - tenth pass)
@@ -236,6 +260,8 @@ func _run() -> void:
 		check(String(rec.get("outcome", "")) == "accepted", "recorder: outcome accepted")
 		check(rec.get("head_fwd_release") == null and rec.get("head_stability_deg") == null,
 			"recorder v2: a throw without head data records null head fields, no crash")
+		check(int(rec.get("v", 0)) == 3 and rec.get("aim_cross") == null and rec.get("target_cross") == null,
+			"recorder v3: a no-head throw flew the old intent path (aim fields null)")
 	var soft: Array = []
 	for si: int in 20:
 		soft.append(ThrowFeatures.make_sample(float(si) / 90.0, Vector3(0.2, 1.4, 0.3), Vector3(0.0, 0.0, -0.5), Vector3.ZERO))
@@ -259,7 +285,9 @@ func _run() -> void:
 	# per-sample hp/hq AND the four precomputed head summaries.
 	main._on_clear_throw_log()
 	var head_motion: Array = make_motion(7.9, false)
-	var head_q := Quaternion.from_euler(Vector3(0.12, -0.2, 0.0))
+	# Mild, plate-looking head pose: the eleventh-pass aim solver must
+	# succeed on this throw so the record carries its aim crosses.
+	var head_q := Quaternion.from_euler(Vector3(0.03, -0.04, 0.0))
 	for raw_h: Variant in head_motion:
 		var hs: Dictionary = raw_h
 		hs["hp"] = Vector3(0.05, 1.68, 0.4)
@@ -269,8 +297,8 @@ func _run() -> void:
 	check(main.throws_recorded == 1, "recorder v2: head throw appended")
 	var h_lines: Array = FileAccess.get_file_as_string("user://throws.jsonl").split("\n", false)
 	var h_parsed: Variant = JSON.parse_string(h_lines[0]) if h_lines.size() == 1 else null
-	check(h_parsed is Dictionary and int((h_parsed as Dictionary).get("v", 0)) == 2,
-		"recorder v2: record version is 2")
+	check(h_parsed is Dictionary and int((h_parsed as Dictionary).get("v", 0)) == 3,
+		"recorder v3: record version is 3")
 	if h_parsed is Dictionary:
 		var h_rec: Dictionary = h_parsed
 		var h_samples: Variant = h_rec.get("samples")
@@ -294,6 +322,12 @@ func _run() -> void:
 			"recorder v2: head_fwd_window + head_fwd_at_peak present")
 		check(absf(float(h_rec.get("head_stability_deg", -1.0))) < 0.5,
 			"recorder v2: a still head reads ~0 deg stability (got %s)" % str(h_rec.get("head_stability_deg")))
+		check(h_rec.get("target_cross") is Array and h_rec.get("aim_cross") is Array
+			and h_rec.get("head_cross_raw") is Array,
+			"recorder v3: head-data throw carries target / aim / raw head crosses")
+		check(absf(float(h_rec.get("scatter_k", -1.0)) - main.scatter_k) < 0.001
+			and h_rec.get("gaze_calibrated") is bool,
+			"recorder v3: scatter k + gaze flag recorded (k=%s)" % str(h_rec.get("scatter_k")))
 	else:
 		check(false, "recorder v2: head record parses as JSON")
 
@@ -356,6 +390,31 @@ func _run() -> void:
 	main._enrollment_throw(gear_feats, 7.45, gear_motion)
 	check(absf(main.fast_anchor - 7.45) < 0.002,
 		"gear anchor is the MEDIAN of 3 (got %.3f)" % main.fast_anchor)
+
+	# Profile v2 -> v3 (eleventh pass): the v3 bump adds gaze + scatter
+	# and changes NO feature vector, so v2 templates must LOAD (not
+	# drop), gaze starts uncalibrated, and the panel suggests Re-gaze.
+	var v2_feats: Array = []
+	for v2i: int in 15:
+		v2_feats.append(0.05 * float(v2i))
+	var v2_data: Dictionary = {
+		"version": 2, "hand": "R", "posture": "STAND",
+		"calib_max": 7.7, "boost": 1.0, "fast_anchor": 7.6, "med_anchor": 6.6,
+		"pbs": {}, "templates": {"FB": {"features": v2_feats, "spread": 0.3}}, "pitches": {},
+	}
+	check(ProfileStore.save_profile("user://duel_profile.json", v2_data), "v2 profile written for the v3 upgrade test")
+	main.templates.clear()
+	main.gaze_calibrated = false
+	main._load_profile()
+	check(main.templates.has("FB"), "v2 templates SURVIVE the v3 bump (no vector change)")
+	check(not main.gaze_calibrated, "v2 profile loads with gaze uncalibrated (uncorrected aim)")
+	check(main.last_result.contains("Re-gaze"), "v2 load suggests Re-gaze (%s)" % main.last_result)
+	# Scatter persists through a save/load round-trip at v3.
+	main.scatter_k = 0.4
+	main._save_profile()
+	main.scatter_k = 0.25
+	main._load_profile()
+	check(absf(main.scatter_k - 0.4) < 0.001, "scatter k persists in the v3 profile (%.2f)" % main.scatter_k)
 
 	# Profile v1 -> v2 upgrade (seventh pass): the v1 file's templates
 	# hold 12-feature vectors the v2 classifier must NOT silently read.

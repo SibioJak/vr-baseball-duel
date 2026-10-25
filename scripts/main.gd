@@ -18,6 +18,11 @@ const PROFILE_PATH: String = "user://duel_profile.json"
 # position/orientation (hp/hq) and each record precomputes head-line
 # summaries (see _record_throw_attempt). v1 lines stay plain JSONL;
 # nothing in this file reads old records back except the line count.
+# Eleventh pass: records are v3 - each accepted throw also carries the
+# head-line aim decomposition (head_cross_raw / target_cross /
+# aim_cross / scatter_k / gaze_calibrated, see _compute_aim). AIM moved
+# from the hand to the head line per Chris's session data; velocity
+# mapping is untouched - the arm keeps the power.
 const THROW_LOG_PATH: String = "user://throws.jsonl"
 const PLATE_POS: Vector3 = Vector3(0.0, 0.0, -18.44) # 60.5 ft from the mound
 const ZONE_HALF_W: float = 0.216 # 17 in wide zone
@@ -83,6 +88,29 @@ var cb_cue: String = "doorknob" # chosen CB cue key (CB_CUES), stored with the C
 var watch_selection: String = "MIX"
 var rng := RandomNumberGenerator.new()
 
+# Head-line aim (eleventh pass). The target comes from the player's
+# gaze-corrected head line; the hand's miss leaks in scaled by
+# scatter_k (panel slider, persisted). gaze_correction is the rotation
+# fitted at gaze calibration (ThrowFeatures.gaze_correction_fit) that
+# maps a raw head forward onto the player's true eye line; identity +
+# gaze_calibrated false until the gaze step runs.
+var scatter_k: float = 0.25
+var gaze_correction: Quaternion = Quaternion.IDENTITY
+var gaze_calibrated: bool = false
+var gaze_offset_deg: float = 0.0 # largest single-target offset at calibration
+var gaze_fit_error_deg: float = -1.0
+# Gaze step runtime: targets light one at a time on the zone frame;
+# a target captures by DWELL - head forward stable (< GAZE_STABLE_DEG
+# max deviation over a rolling GAZE_DWELL_S window). Chris's measured
+# in-delivery head stability was 0.2 deg, so 1.5 deg is generous.
+const GAZE_DWELL_S: float = 0.75
+const GAZE_STABLE_DEG: float = 1.5
+var gaze_idx: int = 0
+var gaze_targets: Array = [] # Vector3 plate-plane points, in light order
+var gaze_captures: Array = [] # {head_pos, head_fwd, target} per captured target
+var gaze_hist: Array = [] # [elapsed_s, Vector3 fwd] rolling dwell window
+var gaze_clock: float = 0.0
+
 # ---------------------------------------------------------------- nodes
 var origin: XROrigin3D
 var cam: XRCamera3D
@@ -133,6 +161,10 @@ var throws_label: Label
 var watch_row: HBoxContainer
 var boost_slider: HSlider
 var boost_value_label: Label
+var scatter_slider: HSlider
+var scatter_value_label: Label
+var gaze_root: Node3D
+var gaze_markers: Array = [] # MeshInstance3D, one per gaze target
 var debug_label: Label
 var debug_tick: int = 0
 
@@ -163,6 +195,7 @@ func _ready() -> void:
 	_build_panel()
 	_build_ai()
 	_build_ghost()
+	_build_gaze()
 	_build_audio()
 	_load_profile()
 	_init_throw_log()
@@ -588,6 +621,7 @@ func _build_panel() -> void:
 	re_row.add_child(_btn("Re-enroll FB", func() -> void: _start_enrollment(["fb", "gear_fast", "gear_med"])))
 	re_row.add_child(_btn("Re-enroll CB", func() -> void: _start_enrollment(["cb"])))
 	re_row.add_child(_btn("Re-enroll 3rd", func() -> void: _start_enrollment(["p3"])))
+	re_row.add_child(_btn("Re-gaze", func() -> void: _start_enrollment(["gaze"])))
 	re_row.add_child(_btn("Erase profile", _on_wipe))
 
 	# CB cue picker: only visible while the curveball enrollment step is
@@ -634,13 +668,33 @@ func _build_panel() -> void:
 	boost_slider.max_value = 1.2
 	boost_slider.step = 0.01
 	boost_slider.value = 1.0
-	boost_slider.custom_minimum_size = Vector2(420.0, 0.0)
+	boost_slider.custom_minimum_size = Vector2(300.0, 0.0)
 	boost_slider.value_changed.connect(_on_boost_changed)
 	boost_row.add_child(boost_slider)
 	boost_value_label = Label.new()
 	boost_value_label.text = "1.00x"
 	boost_value_label.add_theme_font_size_override("font_size", 23)
 	boost_row.add_child(boost_value_label)
+	# Scatter shares the Boost row (eleventh pass) so the panel does not
+	# grow a line: k = how much of your hand's miss leaks into the pitch.
+	# 0.00 = the ball goes exactly where you look; higher = more of the
+	# arm's error survives. Tunable live, persisted in the profile.
+	var scatter_lbl := Label.new()
+	scatter_lbl.text = "Scatter"
+	scatter_lbl.add_theme_font_size_override("font_size", 23)
+	boost_row.add_child(scatter_lbl)
+	scatter_slider = HSlider.new()
+	scatter_slider.min_value = 0.0
+	scatter_slider.max_value = 0.6
+	scatter_slider.step = 0.05
+	scatter_slider.value = 0.25
+	scatter_slider.custom_minimum_size = Vector2(240.0, 0.0)
+	scatter_slider.value_changed.connect(_on_scatter_changed)
+	boost_row.add_child(scatter_slider)
+	scatter_value_label = Label.new()
+	scatter_value_label.text = "0.25"
+	scatter_value_label.add_theme_font_size_override("font_size", 23)
+	boost_row.add_child(scatter_value_label)
 
 	result_label = Label.new()
 	result_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -658,7 +712,7 @@ func _build_panel() -> void:
 	controls.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	controls.add_theme_font_size_override("font_size", 18)
 	controls.add_theme_color_override("font_color", Color(0.55, 0.62, 0.72))
-	controls.text = "CONTROLS - The ball is in your throwing hand (ORANGE band = right hand, CYAN band = left). Throwing hand: squeeze GRIP, throw, let go of GRIP at your release point - your ARM is the throw. Other hand: point the beam at this panel (red = aiming, green = on the panel, dot = where it lands) and pull TRIGGER to click buttons or drag the Boost slider. During curveball enrollment: pick a cue picture (Doorknob / Shade / Chop) and watch the ghost arm demo it. Quest system button (long-press): recenter. Nothing else is bound."
+	controls.text = "CONTROLS - The ball is in your throwing hand (ORANGE band = right hand, CYAN band = left). Throwing hand: squeeze GRIP, throw, let go of GRIP at your release point - your ARM is the throw, your EYES are the aim: look at your spot through the delivery. Other hand: point the beam at this panel (red = aiming, green = on the panel, dot = where it lands) and pull TRIGGER to click buttons or drag the Boost / Scatter sliders. Scatter: how much of your hand's miss leaks into the pitch (0.00 = pure eye line). Enrollment starts with GAZE: look at each lit target on the strike-zone frame and hold your gaze - it captures by itself when your head is still. During curveball enrollment: pick a cue picture (Doorknob / Shade / Chop) and watch the ghost arm demo it. Quest system button (long-press): recenter. Nothing else is bound."
 	vbox.add_child(controls)
 
 	# DEBUG block (temporary): live XR chain state per hand, so a single
@@ -770,6 +824,8 @@ func _refresh_ui() -> void:
 	posture_btn.text = "Posture: " + ("STANDING" if posture == "STAND" else "SITTING")
 	boost_slider.set_value_no_signal(boost_mult)
 	boost_value_label.text = "%.2fx" % boost_mult
+	scatter_slider.set_value_no_signal(scatter_k)
+	scatter_value_label.text = "%.2f" % scatter_k
 	watch_row.visible = mode == Mode.WATCH
 	skip_btn.visible = enrolling and enroll_idx < enroll_queue.size() and String(enroll_queue[enroll_idx]) == "p3"
 	begin_btn.visible = not enrolling
@@ -778,6 +834,10 @@ func _refresh_ui() -> void:
 	cue_row.visible = on_cb_step
 	if ghost_root != null:
 		ghost_root.visible = on_cb_step
+	# The gaze targets exist only while the gaze step is live.
+	var on_gaze_step: bool = enrolling and enroll_idx < enroll_queue.size() and String(enroll_queue[enroll_idx]) == "gaze"
+	if gaze_root != null:
+		gaze_root.visible = on_gaze_step
 	for cue_key: String in cue_btns.keys():
 		var cue_b: Button = cue_btns[cue_key]
 		var cue_d: Dictionary = CB_CUES[cue_key]
@@ -792,6 +852,11 @@ func _refresh_ui() -> void:
 		status += "Gears: FAST %.2f m/s, MEDIUM %.2f m/s. " % [fast_anchor, med_anchor]
 	if enrolled:
 		status += "Enrolled: " + ", ".join(templates.keys()) + ". "
+	if calib_max > 0.01 or enrolled:
+		if gaze_calibrated:
+			status += "Gaze calibrated (offset up to %.0f deg, corrected). " % gaze_offset_deg
+		else:
+			status += "Gaze NOT calibrated - press Re-gaze; until then aim uses your raw head line. "
 	if not pbs.is_empty():
 		var pb_parts: Array = []
 		for k: String in pbs.keys():
@@ -812,6 +877,8 @@ func _current_prompt() -> String:
 		var step: String = enroll_queue[enroll_idx]
 		var got: int = step_speeds.size()
 		match step:
+			"gaze":
+				return "GAZE CALIBRATION - Look at the lit target on the strike-zone frame and hold your gaze. It captures on its own when your head is still (%d of 5). No throwing in this step - just look." % [gaze_idx + 1]
 			"calib":
 				return "CALIBRATION - Throw your hardest COMFORTABLE fastball (%d of 3). Hold GRIP to hold the ball, throw, release GRIP to let go." % [got + 1]
 			"fb":
@@ -829,8 +896,8 @@ func _current_prompt() -> String:
 		return "FROM THE BOX - See: %s. Press THROW IT and watch it come in. The arm you see replays YOUR enrolled motion, retimed so its speed matches the number." % watch_selection
 	if templates.has("FB"):
 		if templates.has("CB"):
-			return "FREE THROW - Grip, throw, release. The gun reads every pitch: type, confidence, velocity."
-		return "FREE THROW - Grip, throw, release. The gun is live on fastballs: velocity, gear, call."
+			return "FREE THROW - Grip, throw, release, and LOOK at your spot - your eyes aim the pitch, your arm powers it. The gun reads every pitch: type, confidence, velocity."
+		return "FREE THROW - Grip, throw, release, and LOOK at your spot - your eyes aim the pitch, your arm powers it. The gun is live on fastballs: velocity, gear, call."
 	return "Pick your throwing hand and posture, then press Begin enrollment. Your arm teaches the game your fastball."
 
 
@@ -870,13 +937,22 @@ func _on_boost_changed(value: float) -> void:
 		_save_profile()
 
 
+func _on_scatter_changed(value: float) -> void:
+	scatter_k = value
+	scatter_value_label.text = "%.2f" % scatter_k
+	if calib_max > 0.01:
+		_save_profile()
+
+
 func _on_begin() -> void:
 	_play_click()
 	# Ninth pass (Chris): fastball only until it works. The default flow
 	# teaches calibration, the fastball, and the velocity gears - the CB
 	# and third-pitch steps stay built and reachable via Re-enroll, they
 	# are just not on the default path anymore.
-	_start_enrollment(["calib", "fb", "gear_fast", "gear_med"])
+	# Eleventh pass: GAZE leads - the aim line is calibrated before the
+	# arm teaches anything, so every later throw aims with corrected eyes.
+	_start_enrollment(["gaze", "calib", "fb", "gear_fast", "gear_med"])
 
 
 func _on_skip() -> void:
@@ -896,6 +972,10 @@ func _on_wipe() -> void:
 	pending_calib_max = 0.0
 	fast_anchor = 0.0
 	med_anchor = 0.0
+	gaze_correction = Quaternion.IDENTITY
+	gaze_calibrated = false
+	gaze_offset_deg = 0.0
+	gaze_fit_error_deg = -1.0
 	separation_note = ""
 	last_result = "Profile erased. Enroll again when ready."
 	_play_click()
@@ -923,6 +1003,7 @@ func _start_enrollment(steps: Array) -> void:
 	enroll_idx = 0
 	enrolling = true
 	_reset_step()
+	_begin_step_extras()
 	_place_panel()
 	_refresh_ui()
 
@@ -937,6 +1018,10 @@ func _step_target_count() -> int:
 	if enroll_idx >= enroll_queue.size():
 		return 0
 	match String(enroll_queue[enroll_idx]):
+		"gaze":
+			# Five targets, captured by dwell - never by throws (a throw
+			# during the gaze step just flies; see _enrollment_throw).
+			return 5
 		"calib", "fb", "cb", "p3":
 			return 3
 		"gear_fast", "gear_med":
@@ -953,7 +1038,16 @@ func _advance_step() -> void:
 	if enroll_idx >= enroll_queue.size():
 		enrolling = false
 		_finish_enrollment()
+	else:
+		_begin_step_extras()
 	_refresh_ui()
+
+
+## Per-step setup that is not throw counting: the gaze step builds its
+## targets and dwell state when it becomes the current step.
+func _begin_step_extras() -> void:
+	if enrolling and enroll_idx < enroll_queue.size() and String(enroll_queue[enroll_idx]) == "gaze":
+		_begin_gaze()
 
 
 func _finish_enrollment() -> void:
@@ -1110,10 +1204,11 @@ func _finalize_throw() -> void:
 		_refresh_ui()
 		return
 	var features: PackedFloat32Array = ThrowFeatures.extract_features(samples)
-	var detail: Dictionary = {"enroll": null, "verdict": null, "flight": null}
+	var detail: Dictionary = {"enroll": null, "verdict": null, "flight": null, "aim": null}
 	if enrolling:
 		var eo: Dictionary = _enrollment_throw(features, speed, samples)
 		var e_meta: Dictionary = eo["flight_meta"]
+		detail["aim"] = e_meta.get("aim")
 		detail["enroll"] = {
 			"step": String(eo["step"]), "count": int(eo["count"]),
 			"target": int(eo["target"]), "completed": bool(eo["completed"]),
@@ -1123,6 +1218,7 @@ func _finalize_throw() -> void:
 	else:
 		var fo: Dictionary = _free_throw(features, speed, samples)
 		var f_meta: Dictionary = fo["flight_meta"]
+		detail["aim"] = f_meta.get("aim")
 		detail["flight"] = _flight_record(f_meta)
 		detail["over_calib_max"] = bool(fo.get("over_calib_max", false))
 		if bool(fo["classified"]) or bool(fo.get("fb_only", false)):
@@ -1169,6 +1265,10 @@ func _finalize_throw() -> void:
 ## head_fwd_at_peak / head_stability_deg) so offline analysis reads
 ## the candidate aim signal directly instead of redoing quaternion
 ## math. Throws with no head data record nulls for those fields.
+## Eleventh pass (v3): accepted throws also carry the aim decomposition
+## (head_cross_raw / target_cross / aim_cross / scatter_k /
+## gaze_calibrated) - the three plate crosses the head-line model
+## reasoned from, beside the flight's achieved cross.
 
 func _init_throw_log() -> void:
 	throw_log_abs_path = ProjectSettings.globalize_path(THROW_LOG_PATH)
@@ -1197,7 +1297,7 @@ func _on_clear_throw_log() -> void:
 
 func _record_throw_attempt(samples: Array, features: PackedFloat32Array, speed: float, intent_dir: Vector3, has_intent: bool, mode_str: String, step_str: String, outcome_str: String, reason: String, detail: Dictionary) -> void:
 	var rec: Dictionary = {}
-	rec["v"] = 2
+	rec["v"] = 3
 	rec["seq"] = throws_recorded + 1
 	rec["ts"] = Time.get_datetime_string_from_system()
 	rec["ts_unix"] = Time.get_unix_time_from_system()
@@ -1253,6 +1353,29 @@ func _record_throw_attempt(samples: Array, features: PackedFloat32Array, speed: 
 		rec["head_fwd_window"] = null
 		rec["head_fwd_at_peak"] = null
 		rec["head_stability_deg"] = null
+	# Head-line aim decomposition (recorder v3, eleventh pass): where
+	# the RAW head ray crossed, where the corrected look targeted (T),
+	# and where the flight was actually aimed after the hand's scaled
+	# leak (A = T + (I - T) * k). Nulls when the throw flew the old
+	# intent path (no head data) - analysis reads the three crosses
+	# against the flight's achieved plate_cross to grade the model.
+	var aim_v: Variant = detail.get("aim", null)
+	if aim_v is Dictionary:
+		var aim_d: Dictionary = aim_v
+		var hcr_v: Variant = aim_d.get("head_cross_raw", null)
+		rec["head_cross_raw"] = _vec3_arr(hcr_v) if hcr_v is Vector3 else null
+		var tc_v: Variant = aim_d.get("target_cross", null)
+		rec["target_cross"] = _vec3_arr(tc_v) if tc_v is Vector3 else null
+		var ac_v: Variant = aim_d.get("aim_cross", null)
+		rec["aim_cross"] = _vec3_arr(ac_v) if ac_v is Vector3 else null
+		rec["scatter_k"] = float(aim_d.get("scatter_k", scatter_k))
+		rec["gaze_calibrated"] = bool(aim_d.get("gaze_calibrated", gaze_calibrated))
+	else:
+		rec["head_cross_raw"] = null
+		rec["target_cross"] = null
+		rec["aim_cross"] = null
+		rec["scatter_k"] = scatter_k
+		rec["gaze_calibrated"] = gaze_calibrated
 	rec["outcome"] = outcome_str
 	rec["reason"] = reason
 	rec["reason_text"] = last_result
@@ -1372,6 +1495,16 @@ func _call_for_flight(meta: Dictionary) -> String:
 ## visual flight's meta. Behavior unchanged.
 func _enrollment_throw(features: PackedFloat32Array, speed: float, samples: Array) -> Dictionary:
 	var step: String = enroll_queue[enroll_idx]
+	if step == "gaze":
+		# The gaze step counts LOOKS, not throws. A throw here still
+		# flies (every accepted throw does) but teaches nothing and
+		# advances nothing.
+		var gaze_flight: Dictionary = _spawn_visual_flight(samples, features, "FB")
+		last_result = "Gaze step - just look at the lit target and hold. (That throw flew; it doesn't count here.)"
+		return {
+			"step": step, "count": gaze_idx, "target": 5,
+			"completed": false, "avg_speed": null, "flight_meta": gaze_flight,
+		}
 	step_features.append(features)
 	step_speeds.append(speed)
 	step_last_motion = samples
@@ -1444,6 +1577,72 @@ func _enrollment_flight_pitch(step: String) -> String:
 	return "FB"
 
 
+## Head-line aim (eleventh pass). Returns {} when the throw carries no
+## usable head data - the caller then flies the old intent path
+## byte-identically. Otherwise:
+##   target T  = the gaze-corrected head ray's plate cross (the head
+##               position + window-mean forward from recorder v2's
+##               head_summary, rotated by the fitted gaze correction)
+##   intent I  = the hand intent ray's straight-line plate cross
+##   aim A     = T + (I - T) * scatter_k - a delivery whose hand agrees
+##               with the head flies true to the look; a sloppy one
+##               leaks k of its hand error (Chris's field law: slow
+##               throws agree better, so they group tighter)
+## and the launch direction is SOLVED against the real flight sim so
+## the ball crosses at A, gravity drop included (ThrowFeatures.
+## solve_aim_dir). The returned "public" block is what the throw
+## recorder writes (record v3) and what the flight meta carries.
+func _compute_aim(samples: Array, rel_pos: Vector3, mph: float, spin_axis: Vector3, spin_rate: float) -> Dictionary:
+	var head: Dictionary = ThrowFeatures.head_summary(samples)
+	if not bool(head.get("has_head", false)):
+		return {}
+	var head_pos: Vector3 = head["pos"]
+	var raw_fwd: Vector3 = head["window"]
+	if raw_fwd.length() < 0.01 or head_pos.length() < 0.01:
+		return {}
+	var raw_cross_d: Dictionary = ThrowFeatures.plate_cross(head_pos, raw_fwd)
+	var corr_fwd: Vector3 = (gaze_correction * raw_fwd).normalized()
+	var corr_cross_d: Dictionary = ThrowFeatures.plate_cross(head_pos, corr_fwd)
+	if not bool(corr_cross_d["crossed"]):
+		return {}
+	var target: Vector3 = corr_cross_d["cross"]
+	var intent_dir: Vector3 = ThrowFeatures.release_intent_dir(samples)
+	var intent_cross_d: Dictionary = ThrowFeatures.plate_cross(rel_pos, intent_dir)
+	var intent_cross: Vector3 = target
+	if bool(intent_cross_d["crossed"]):
+		intent_cross = intent_cross_d["cross"]
+	var aim_pt: Vector3 = ThrowFeatures.aim_cross(target, intent_cross, scatter_k)
+	var solved: Dictionary = ThrowFeatures.solve_aim_dir(rel_pos, mph / ThrowFeatures.MPH_PER_MPS, spin_axis, spin_rate, aim_pt)
+	if not bool(solved["crossed"]):
+		return {}
+	var pub: Dictionary = {
+		"target_cross": target, "aim_cross": aim_pt,
+		"scatter_k": scatter_k, "gaze_calibrated": gaze_calibrated,
+	}
+	if bool(raw_cross_d["crossed"]):
+		var rc: Vector3 = raw_cross_d["cross"]
+		pub["head_cross_raw"] = rc
+	else:
+		pub["head_cross_raw"] = null
+	var sol_dir: Vector3 = solved["dir"]
+	return {"dir": sol_dir, "public": pub}
+
+
+## Every PLAYER throw's flight routes through here (free throw,
+## enrollment, pre-enrollment strays): head-line aim when head data
+## exists, the pre-eleventh-pass intent path - byte-identical - when
+## it does not. Watch-mode AI pitches call _start_flight directly and
+## keep their existing called-spot behavior.
+func _start_player_flight(samples: Array, rel_pos: Vector3, mph: float, pitch: String, spin_axis: Vector3, spin_rate: float, meta: Dictionary) -> Dictionary:
+	var aim: Dictionary = _compute_aim(samples, rel_pos, mph, spin_axis, spin_rate)
+	if aim.is_empty():
+		return _start_flight(rel_pos, ThrowFeatures.release_intent_dir(samples), mph, pitch, spin_axis, spin_rate, meta)
+	var m2: Dictionary = meta.duplicate()
+	m2["aim"] = aim["public"]
+	var dir: Vector3 = aim["dir"]
+	return _start_flight(rel_pos, dir, mph, pitch, spin_axis, spin_rate, m2)
+
+
 ## Spawn a visible flight for a throw the classifier is not scoring:
 ## enrollment throws and pre-enrollment "just a throw" tosses. Speed uses
 ## the normal map when a calibration exists; before one lands, the anchor
@@ -1463,9 +1662,11 @@ func _spawn_visual_flight(samples: Array, features: PackedFloat32Array, pitch: S
 			anchor = maxf(anchor, s)
 	var mph: float = ThrowFeatures.map_velocity(speed, anchor, boost_mult)
 	var spin: Dictionary = ThrowFeatures.spin_params(pitch, ThrowFeatures.roll01_from_features(features))
-	# Flight direction = the arm's intent (peak-speed window), never the
-	# grip-release frame - see release_intent_dir.
-	return _start_flight(rel_pos, ThrowFeatures.release_intent_dir(samples), mph, pitch, spin["axis"], float(spin["rate"]), {
+	var spin_axis: Vector3 = spin["axis"]
+	# Flight aim = the head line (eleventh pass), falling back to the
+	# arm's intent direction (peak-speed window) when the throw carries
+	# no head data - see _start_player_flight.
+	return _start_player_flight(samples, rel_pos, mph, pitch, spin_axis, float(spin["rate"]), {
 		"quiet": true, "watch": false,
 	})
 
@@ -1525,13 +1726,14 @@ func _free_throw(features: PackedFloat32Array, speed: float, samples: Array) -> 
 	var rel_pos: Vector3 = release["p"]
 	var spin: Dictionary = ThrowFeatures.spin_params(pitch, ThrowFeatures.roll01_from_features(features))
 	var axis: Vector3 = spin["axis"]
-	# Flight direction = release intent (peak-speed window). Speed still
-	# comes from the release sample via the caller's `speed` - magnitude
-	# semantics unchanged, only the direction stopped trusting the button.
+	# Flight aim = the head line (eleventh pass) via _start_player_flight,
+	# with release intent (peak-speed window) as the no-head fallback.
+	# Speed still comes from the release sample via the caller's `speed`
+	# - magnitude semantics unchanged.
 	var meta: Dictionary = {"confidence": confidence, "gear": gear, "watch": false}
 	if fb_only:
 		meta["fb_only"] = true
-	var flight_meta: Dictionary = _start_flight(rel_pos, ThrowFeatures.release_intent_dir(samples), mph, pitch, axis, float(spin["rate"]), meta)
+	var flight_meta: Dictionary = _start_player_flight(samples, rel_pos, mph, pitch, axis, float(spin["rate"]), meta)
 	release_player.play()
 	return {
 		"classified": classified, "fb_only": fb_only, "pitch": pitch,
@@ -1576,6 +1778,7 @@ func _process(delta: float) -> void:
 	_update_flights(delta)
 	_update_ai(delta)
 	_update_ghost(delta)
+	_update_gaze(delta)
 
 
 func _update_flights(delta: float) -> void:
@@ -1646,6 +1849,147 @@ func _pitch_name(pitch: String) -> String:
 		"P3":
 			return "THIRD PITCH"
 	return pitch
+
+
+# ---------------------------------------------------------------- gaze calibration (eleventh pass)
+## The eye line is calibrated the way it is used: the player LOOKS at
+## known targets. Five markers light one at a time on the zone frame
+## (center, then the four corners inset a touch from the frame edges).
+## No buttons: a target captures by dwell when the head forward holds
+## stable - the same stillness his deliveries already showed (0.2 deg
+## in-window). The five (measured ray -> known target) pairs fit ONE
+## rotation correction (ThrowFeatures.gaze_correction_fit): the fixed
+## rotation between the headset's forward and the player's eye line,
+## dominated in Chris's data by a consistent up-right bias.
+
+func _build_gaze() -> void:
+	gaze_root = Node3D.new()
+	gaze_root.name = "GazeTargets"
+	gaze_root.visible = false
+	add_child(gaze_root)
+
+
+func _begin_gaze() -> void:
+	gaze_idx = 0
+	gaze_captures.clear()
+	gaze_hist.clear()
+	gaze_clock = 0.0
+	var inset: float = 0.035
+	var mid_y: float = (zone_bottom + zone_top) * 0.5
+	var xl: float = -ZONE_HALF_W + inset
+	var xr: float = ZONE_HALF_W - inset
+	var yb: float = zone_bottom + inset
+	var yt: float = zone_top - inset
+	var z: float = PLATE_POS.z
+	gaze_targets = [
+		Vector3(0.0, mid_y, z),
+		Vector3(xl, yt, z), Vector3(xr, yt, z),
+		Vector3(xl, yb, z), Vector3(xr, yb, z),
+	]
+	for child: Node in gaze_root.get_children():
+		child.queue_free()
+	gaze_markers.clear()
+	for target: Variant in gaze_targets:
+		var tp: Vector3 = target
+		var mesh := SphereMesh.new()
+		mesh.radius = 0.028
+		mesh.height = 0.056
+		var marker := MeshInstance3D.new()
+		marker.mesh = mesh
+		marker.position = tp
+		gaze_root.add_child(marker)
+		gaze_markers.append(marker)
+	_update_gaze_markers()
+
+
+func _update_gaze_markers() -> void:
+	for i: int in gaze_markers.size():
+		var marker: MeshInstance3D = gaze_markers[i]
+		if i < gaze_idx:
+			marker.material_override = _mat(Color(0.25, 0.8, 0.4), 0.5)
+			marker.scale = Vector3.ONE
+		elif i == gaze_idx:
+			marker.material_override = _mat(Color(1.0, 0.8, 0.2), 2.2)
+			marker.scale = Vector3.ONE * 1.35
+		else:
+			marker.material_override = _mat(Color(0.35, 0.42, 0.55), 0.25)
+			marker.scale = Vector3.ONE
+
+
+func _update_gaze(delta: float) -> void:
+	if not enrolling or enroll_idx >= enroll_queue.size():
+		return
+	if String(enroll_queue[enroll_idx]) != "gaze":
+		return
+	if gaze_idx >= gaze_targets.size() or cam == null:
+		return
+	gaze_clock += delta
+	var fwd: Vector3 = (-cam.global_transform.basis.z).normalized()
+	gaze_hist.append([gaze_clock, fwd])
+	while gaze_hist.size() > 1:
+		var first: Array = gaze_hist[0]
+		if gaze_clock - float(first[0]) > GAZE_DWELL_S:
+			gaze_hist.pop_front()
+		else:
+			break
+	if gaze_hist.size() < 2:
+		return
+	# The trimmed window's span tops out just under GAZE_DWELL_S (the
+	# oldest sample is always < one window old), so "held for the full
+	# dwell" reads as: the window is populated across >= 90% of it AND
+	# every sample inside it is stable (checked below).
+	var first2: Array = gaze_hist[0]
+	if gaze_clock - float(first2[0]) < GAZE_DWELL_S * 0.9:
+		return
+	# Stability over the rolling window: mean forward, worst deviation.
+	var acc := Vector3.ZERO
+	for raw: Variant in gaze_hist:
+		var entry: Array = raw
+		var f: Vector3 = entry[1]
+		acc += f
+	if acc.length() < 0.0001:
+		return
+	var mean_fwd: Vector3 = acc.normalized()
+	var max_dev: float = 0.0
+	for raw2: Variant in gaze_hist:
+		var entry2: Array = raw2
+		var f2: Vector3 = entry2[1]
+		max_dev = maxf(max_dev, rad_to_deg(mean_fwd.angle_to(f2)))
+	if max_dev >= GAZE_STABLE_DEG:
+		return
+	# Captured. The pair is (the head ray he wore while looking, the
+	# known target) - whatever the ray's plate cross was, the fit learns
+	# from the pairing, so no proximity gate: a player whose bias is
+	# large is exactly the player this step exists for.
+	gaze_captures.append({
+		"head_pos": cam.global_position, "head_fwd": mean_fwd,
+		"target": gaze_targets[gaze_idx],
+	})
+	_play_click()
+	gaze_idx += 1
+	gaze_hist.clear()
+	if gaze_idx >= gaze_targets.size():
+		_finish_gaze()
+	else:
+		_update_gaze_markers()
+		_refresh_ui()
+
+
+func _finish_gaze() -> void:
+	var fit: Dictionary = ThrowFeatures.gaze_correction_fit(gaze_captures)
+	if int(fit.get("count", 0)) > 0:
+		var corr: Quaternion = fit["correction"]
+		gaze_correction = corr
+		gaze_calibrated = true
+		gaze_offset_deg = float(fit["max_delta_deg"])
+		gaze_fit_error_deg = float(fit["fit_error_deg"])
+		if gaze_offset_deg > 12.0:
+			last_result = "Gaze calibrated - a LARGE gaze offset was measured (%.0f deg) and the correction is applied. Your look now aims the pitch (fit error %.1f deg)." % [gaze_offset_deg, gaze_fit_error_deg]
+		else:
+			last_result = "Gaze calibrated (offset %.0f deg, fit error %.1f deg). Your look now aims the pitch." % [gaze_offset_deg, gaze_fit_error_deg]
+		_save_profile()
+	_update_gaze_markers()
+	_advance_step()
 
 
 # ---------------------------------------------------------------- watch mode (from the box)
@@ -1942,6 +2286,11 @@ func _save_profile() -> void:
 		"calib_max": calib_max,
 		"pending_calib_max": pending_calib_max,
 		"boost": boost_mult,
+		"scatter": scatter_k,
+		"gaze_q": [gaze_correction.x, gaze_correction.y, gaze_correction.z, gaze_correction.w],
+		"gaze_calibrated": gaze_calibrated,
+		"gaze_offset_deg": gaze_offset_deg,
+		"gaze_fit_error_deg": gaze_fit_error_deg,
 		"fast_anchor": fast_anchor,
 		"med_anchor": med_anchor,
 		"pbs": pbs.duplicate(),
@@ -1984,6 +2333,17 @@ func _load_profile() -> void:
 	calib_max = float(data.get("calib_max", 0.0))
 	pending_calib_max = float(data.get("pending_calib_max", 0.0))
 	boost_mult = clampf(float(data.get("boost", 1.0)), 0.8, 1.2)
+	# Eleventh pass (profile v3): scatter + gaze correction ride along.
+	# Absent in v2 files -> defaults: k = 0.25, gaze uncorrected.
+	scatter_k = clampf(float(data.get("scatter", 0.25)), 0.0, 0.6)
+	gaze_calibrated = bool(data.get("gaze_calibrated", false))
+	gaze_offset_deg = float(data.get("gaze_offset_deg", 0.0))
+	gaze_fit_error_deg = float(data.get("gaze_fit_error_deg", -1.0))
+	var gaze_q_arr: Array = data.get("gaze_q", [])
+	if gaze_q_arr.size() == 4:
+		var gq := Quaternion(float(gaze_q_arr[0]), float(gaze_q_arr[1]), float(gaze_q_arr[2]), float(gaze_q_arr[3]))
+		if gq.length() > 0.001:
+			gaze_correction = gq.normalized()
 	fast_anchor = float(data.get("fast_anchor", 0.0))
 	med_anchor = float(data.get("med_anchor", 0.0))
 	var saved_pbs: Variant = data.get("pbs", {})
@@ -1991,13 +2351,17 @@ func _load_profile() -> void:
 		var sp: Dictionary = saved_pbs
 		for k: String in sp.keys():
 			pbs[k] = float(sp[k])
-	# Profile format gate (seventh pass): v1 templates hold 12-feature
-	# vectors; the v2 classifier reads 15 (forearm roll added). Restoring
-	# them would silently misread every throw, so templates and their
-	# pitch data are DROPPED here, never converted. Calibration, gears,
-	# PBs, hand, posture and boost are plain scalars in a compatible
-	# form and carry over - only the pitches need re-enrolling.
-	var classifier_upgraded: bool = int(data.get("version", 1)) < ThrowFeatures.PROFILE_VERSION
+	# Profile format gate (seventh pass, narrowed eleventh pass): v1
+	# templates hold 12-feature vectors; the v2 classifier reads 15
+	# (forearm roll added). Restoring them would silently misread every
+	# throw, so templates and their pitch data are DROPPED here, never
+	# converted. Calibration, gears, PBs, hand, posture and boost are
+	# plain scalars in a compatible form and carry over - only the
+	# pitches need re-enrolling. The v3 bump (gaze + scatter) changes
+	# NO vector, so v2 templates load unchanged and only the gaze
+	# defaults to uncorrected, with a Re-gaze suggestion below.
+	var saved_version: int = int(data.get("version", 1))
+	var classifier_upgraded: bool = saved_version < 2
 	if classifier_upgraded:
 		data["templates"] = {}
 		data["pitches"] = {}
@@ -2039,6 +2403,10 @@ func _load_profile() -> void:
 	elif templates.has("FB"):
 		mode = Mode.FREE_THROW
 		last_result = "Profile loaded - free throw is live on fastballs, or go to the box to watch."
+	if saved_version == 2 and not classifier_upgraded:
+		# v2 -> v3: everything carried; the one new thing is the eye
+		# line, and it starts uncalibrated until he runs Re-gaze.
+		last_result += " Eye-line aim is new in this build - press Re-gaze to calibrate yours."
 	# Ball visual follows the loaded throwing hand.
 	var ball_parent: Node = ball_in_hand_mesh.get_parent()
 	if ball_parent != null:

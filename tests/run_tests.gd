@@ -309,6 +309,61 @@ func _init() -> void:
 	var cb_rate_rpm: float = float(cb_spin["rate"]) * 60.0 / TAU
 	check(cb_rate_rpm >= 1800.0 and cb_rate_rpm <= 2500.0, "curveball spin is in the real band (%.0f rpm)" % cb_rate_rpm)
 
+	# --- Head-line aim (eleventh pass) -------------------------------------
+	# Plate cross: a ray down -Z from above the mound crosses at the
+	# plate; a ray pointing away never does.
+	var pc1: Dictionary = ThrowFeatures.plate_cross(Vector3(0.1, 1.7, -0.5), Vector3(0.0, 0.0, -1.0))
+	check(bool(pc1["crossed"]), "plate cross: -Z ray crosses the plate plane")
+	var pc1_pt: Vector3 = pc1["cross"]
+	check(absf(pc1_pt.x - 0.1) < 0.001 and absf(pc1_pt.z - ThrowFeatures.PLATE_Z) < 0.001,
+		"plate cross lands on the plane (x=%.2f)" % pc1_pt.x)
+	var pc2: Dictionary = ThrowFeatures.plate_cross(Vector3(0.1, 1.7, -0.5), Vector3(0.0, 0.2, 1.0))
+	check(not bool(pc2["crossed"]), "plate cross: a ray toward the mound never crosses")
+	# Scatter: A = T + (I - T) * k, exactly.
+	var t_pt := Vector3(0.05, 0.80, ThrowFeatures.PLATE_Z)
+	var i_pt := Vector3(1.05, 1.80, ThrowFeatures.PLATE_Z)
+	check(ThrowFeatures.aim_cross(t_pt, i_pt, 0.0).distance_to(t_pt) < 0.0001,
+		"scatter k=0: aim cross IS the target")
+	var a25: Vector3 = ThrowFeatures.aim_cross(t_pt, i_pt, 0.25)
+	check(a25.distance_to(Vector3(0.30, 1.05, ThrowFeatures.PLATE_Z)) < 0.0001,
+		"scatter k=0.25: aim cross sits 25%% of the way from T to I (%.2f, %.2f)" % [a25.x, a25.y])
+	# Gaze fit: a head worn with a CONSTANT bias (+5 deg yaw, +4 deg
+	# pitch) while looking at the five enrollment targets must fit a
+	# correction that puts a center look back on zone center.
+	var gaze_head := Vector3(0.05, 1.68, 0.35)
+	var gaze_targets_fit: Array = [
+		Vector3(0.0, 0.77, ThrowFeatures.PLATE_Z),
+		Vector3(-0.181, 1.025, ThrowFeatures.PLATE_Z), Vector3(0.181, 1.025, ThrowFeatures.PLATE_Z),
+		Vector3(-0.181, 0.515, ThrowFeatures.PLATE_Z), Vector3(0.181, 0.515, ThrowFeatures.PLATE_Z),
+	]
+	var bias_q: Quaternion = Quaternion.from_euler(Vector3(deg_to_rad(4.0), deg_to_rad(5.0), 0.0))
+	var captures: Array = []
+	for raw_gt: Variant in gaze_targets_fit:
+		var gt: Vector3 = raw_gt
+		var desired: Vector3 = (gt - gaze_head).normalized()
+		captures.append({"head_pos": gaze_head, "head_fwd": bias_q * desired, "target": gt})
+	var fit: Dictionary = ThrowFeatures.gaze_correction_fit(captures)
+	check(int(fit["count"]) == 5, "gaze fit consumed all five captures")
+	check(float(fit["raw_error_deg"]) > 5.0, "gaze fit sees the raw bias (%.1f deg)" % float(fit["raw_error_deg"]))
+	check(float(fit["fit_error_deg"]) < 0.5, "gaze fit residual is ~zero for a rigid bias (%.3f deg)" % float(fit["fit_error_deg"]))
+	var corr_q: Quaternion = fit["correction"]
+	var center_desired: Vector3 = (gaze_targets_fit[0] - gaze_head).normalized()
+	var center_cross: Dictionary = ThrowFeatures.plate_cross(gaze_head, corr_q * (bias_q * center_desired))
+	check(bool(center_cross["crossed"]), "corrected center look crosses the plate")
+	var center_pt: Vector3 = center_cross["cross"]
+	check(Vector2(center_pt.x, center_pt.y).distance_to(Vector2(0.0, 0.77)) < 0.15,
+		"corrected center look lands within 0.15 m of zone center (%.2f, %.2f)" % [center_pt.x, center_pt.y])
+	# Drop-compensated solve: the SIMULATED ball must cross within
+	# ~0.1 m of the aim point at a pro fastball and at a changeup pace.
+	var aim_start := Vector3(0.25, 1.80, -0.60)
+	var aim_target := Vector3(0.10, 0.80, ThrowFeatures.PLATE_Z)
+	var fb_spin2: Dictionary = ThrowFeatures.spin_params("FB", 0.3)
+	var fb_axis2: Vector3 = fb_spin2["axis"]
+	for mph_case: float in [96.0, 65.0]:
+		var solved: Dictionary = ThrowFeatures.solve_aim_dir(aim_start, mph_case / ThrowFeatures.MPH_PER_MPS, fb_axis2, float(fb_spin2["rate"]), aim_target)
+		check(bool(solved["crossed"]) and float(solved["error_m"]) < 0.10,
+			"aim solve at %.0f mph crosses within 0.10 m of the aim point (err %.3f m)" % [mph_case, float(solved["error_m"])])
+
 	# --- Profile store ------------------------------------------------------
 	var path: String = "user://test_profile.json"
 	var data: Dictionary = {"hand": "R", "vals": [1.5, 2.5, 3.5]}

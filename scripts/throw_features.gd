@@ -19,7 +19,12 @@ extends RefCounted
 ## The feature vector grew 12 -> 15, so the profile format bumped to
 ## PROFILE_VERSION 2 (see main.gd's load path for the graceful upgrade).
 
-const PROFILE_VERSION: int = 2
+## Eleventh pass: PROFILE_VERSION 3 - the profile gains the gaze
+## correction (quaternion), the scatter factor k, and a gaze-calibrated
+## flag. NO feature-vector change: v2 templates (15 features) stay
+## valid and load unchanged; only pre-v2 (12-feature) profiles drop
+## their templates, as before.
+const PROFILE_VERSION: int = 3
 const FEATURE_COUNT: int = 15
 # Human-readable name per feature index, in vector order. Doubles as
 # documentation and as the key set for labeled feature dumps (the
@@ -301,7 +306,7 @@ static func head_forward(q: Quaternion) -> Vector3:
 static func head_summary(samples: Array) -> Dictionary:
 	var out: Dictionary = {
 		"has_head": false, "release": Vector3.ZERO, "window": Vector3.ZERO,
-		"at_peak": Vector3.ZERO, "stability_deg": -1.0,
+		"at_peak": Vector3.ZERO, "stability_deg": -1.0, "pos": Vector3.ZERO,
 	}
 	if samples.is_empty():
 		return out
@@ -313,6 +318,8 @@ static func head_summary(samples: Array) -> Dictionary:
 	var lo: int = int(win[1])
 	var hi: int = int(win[2])
 	var acc := Vector3.ZERO
+	var pos_acc := Vector3.ZERO
+	var pos_count: int = 0
 	var win_fwds: Array = []
 	for i: int in range(lo, hi + 1):
 		var s: Dictionary = samples[i]
@@ -322,8 +329,15 @@ static func head_summary(samples: Array) -> Dictionary:
 			var f: Vector3 = head_forward(q)
 			win_fwds.append(f)
 			acc += f
+		var hp_v: Variant = s.get("hp", null)
+		if hp_v is Vector3:
+			var hp: Vector3 = hp_v
+			pos_acc += hp
+			pos_count += 1
 	if win_fwds.is_empty() or acc.length() < 0.0001:
 		return out
+	if pos_count > 0:
+		out["pos"] = pos_acc / float(pos_count)
 	var mean_dir: Vector3 = acc.normalized()
 	var stability: float = 0.0
 	for raw: Variant in win_fwds:
@@ -572,6 +586,169 @@ static func simulate_flight(start: Vector3, vel: Vector3, spin_axis: Vector3, sp
 		if pos.y < 0.0 and t > 0.05:
 			break
 	return {"time": t, "cross_pos": cross_pos, "crossed": crossed, "points": points}
+
+
+## ------------------------------------------------------------------
+## Head-line aim (eleventh pass, Chris's approved rebuild - designed
+## from his sessions 1-2 data: hand-velocity intent scattered 12-18
+## deg across throws, the head line 2.8 deg with 0.2 deg within-throw
+## stability). The model: the TARGET comes from the (gaze-corrected)
+## head ray, the arm keeps velocity, and a scaled share of the hand's
+## angular error survives as execution scatter:
+##   A = T + (I - T) * k        (plate-plane crosses, k = scatter)
+## T = corrected head-ray cross, I = intent-ray cross. The flight is
+## then aimed at A with gravity drop solved against the real sim.
+
+## Straight-line cross of the plate plane (z = PLATE_Z) for a ray.
+## Returns {"crossed": bool, "cross": Vector3 (z = PLATE_Z when crossed)}.
+static func plate_cross(origin: Vector3, dir: Vector3) -> Dictionary:
+	if dir.length() < 0.0001 or dir.z > -0.0001:
+		return {"crossed": false, "cross": origin}
+	var t: float = (PLATE_Z - origin.z) / dir.z
+	if t <= 0.0:
+		return {"crossed": false, "cross": origin}
+	return {"crossed": true, "cross": origin + dir * t}
+
+
+## The aim cross: target T with a k-share of the hand's miss (I - T)
+## leaking through. k = 0 flies exactly to the look; k = 1 is the old
+## hand-aim cross. Pure lerp in plate space.
+static func aim_cross(target: Vector3, intent_cross: Vector3, k: float) -> Vector3:
+	return target + (intent_cross - target) * k
+
+
+## Fit ONE gaze correction from dwell captures. Each capture pairs the
+## head ray the player actually wore while looking at a known target:
+##   {"head_pos": Vector3, "head_fwd": Vector3, "target": Vector3}
+## Method: per capture, the delta quaternion rotating the measured
+## forward onto the desired head_pos->target direction; the correction
+## is the sign-aligned average of those deltas (component mean,
+## renormalized). Chosen over a plate-space offset because a rotation
+## is what the error physically is - the headset's forward and the
+## player's eye line differ by a fixed rotation of the head, not by a
+## translation at one distance - and a single rigid bias (the synthetic
+## test case, and approximately Chris's measured +5/+4 deg) fits to
+## ~zero residual. Returns the correction, the mean angular residual
+## AFTER fitting (fit_error_deg), the mean raw error, the largest
+## single-capture delta (max_delta_deg - the sanity bound main.gd
+## reports when it exceeds 12 deg), and the capture count.
+static func gaze_correction_fit(captures: Array) -> Dictionary:
+	var out: Dictionary = {
+		"correction": Quaternion.IDENTITY, "fit_error_deg": -1.0,
+		"raw_error_deg": -1.0, "max_delta_deg": 0.0, "count": 0,
+	}
+	var sx: float = 0.0
+	var sy: float = 0.0
+	var sz: float = 0.0
+	var sw: float = 0.0
+	var have_ref: bool = false
+	var ref_q := Quaternion.IDENTITY
+	var raw_sum: float = 0.0
+	var max_delta: float = 0.0
+	var deltas: Array = []
+	var pairs: Array = []
+	for raw: Variant in captures:
+		var c: Dictionary = raw
+		var hp_v: Variant = c.get("head_pos", null)
+		var hf_v: Variant = c.get("head_fwd", null)
+		var tg_v: Variant = c.get("target", null)
+		if not (hp_v is Vector3 and hf_v is Vector3 and tg_v is Vector3):
+			continue
+		var hp: Vector3 = hp_v
+		var hf: Vector3 = hf_v
+		var tg: Vector3 = tg_v
+		if hf.length() < 0.01:
+			continue
+		var desired: Vector3 = tg - hp
+		if desired.length() < 0.01:
+			continue
+		desired = desired.normalized()
+		var fwd: Vector3 = hf.normalized()
+		var delta := Quaternion(fwd, desired)
+		if not have_ref:
+			ref_q = delta
+			have_ref = true
+		var dot: float = delta.x * ref_q.x + delta.y * ref_q.y + delta.z * ref_q.z + delta.w * ref_q.w
+		if dot < 0.0:
+			delta = Quaternion(-delta.x, -delta.y, -delta.z, -delta.w)
+		sx += delta.x
+		sy += delta.y
+		sz += delta.z
+		sw += delta.w
+		deltas.append(delta)
+		pairs.append([fwd, desired])
+		raw_sum += rad_to_deg(fwd.angle_to(desired))
+		max_delta = maxf(max_delta, rad_to_deg(fwd.angle_to(desired)))
+	var n: int = pairs.size()
+	if n == 0:
+		return out
+	var correction := Quaternion(sx, sy, sz, sw)
+	if correction.length() < 0.0001:
+		correction = Quaternion.IDENTITY
+	else:
+		correction = correction.normalized()
+	var fit_sum: float = 0.0
+	for raw2: Variant in pairs:
+		var pr: Array = raw2
+		var f2: Vector3 = pr[0]
+		var d2: Vector3 = pr[1]
+		fit_sum += rad_to_deg((correction * f2).angle_to(d2))
+	out["correction"] = correction
+	out["fit_error_deg"] = fit_sum / float(n)
+	out["raw_error_deg"] = raw_sum / float(n)
+	out["max_delta_deg"] = max_delta
+	out["count"] = n
+	return out
+
+
+## Solve the launch direction whose SIMULATED flight crosses the plate
+## plane at `target` (a plate-plane point, z = PLATE_Z), for a ball
+## leaving `start` at `speed_mps` with the given spin. Start from the
+## direction at the target raised by the no-Magnus gravity drop for the
+## flight time, simulate, then ONE refinement: shift the aim point by
+## the full cross error (vertical AND lateral - the curve's Magnus
+## drift is lateral too) and re-derive. Returns the final direction,
+## the achieved cross, and the miss distance. Deterministic: same
+## inputs, same answer, so tests can pin the accuracy.
+static func solve_aim_dir(start: Vector3, speed_mps: float, spin_axis: Vector3, spin_rate: float, target: Vector3) -> Dictionary:
+	var out: Dictionary = {
+		"dir": Vector3(0.0, 0.0, -1.0), "cross_pos": start,
+		"crossed": false, "error_m": -1.0,
+	}
+	if speed_mps < 0.5:
+		return out
+	var dz: float = maxf(start.z - target.z, 1.0)
+	var t_est: float = dz / speed_mps
+	var aim_point: Vector3 = target + Vector3(0.0, 0.5 * GRAVITY * t_est * t_est, 0.0)
+	var best_dir: Vector3 = Vector3(0.0, 0.0, -1.0)
+	var best_cross: Vector3 = start
+	var best_crossed: bool = false
+	var best_err: float = -1.0
+	for iteration: int in 2:
+		var to_aim: Vector3 = aim_point - start
+		if to_aim.length() < 0.01:
+			break
+		var dir: Vector3 = to_aim.normalized()
+		var flight: Dictionary = simulate_flight(start, dir * speed_mps, spin_axis, spin_rate)
+		var crossed: bool = bool(flight["crossed"])
+		var cross: Vector3 = flight["cross_pos"]
+		var err: float = Vector2(target.x - cross.x, target.y - cross.y).length()
+		best_dir = dir
+		best_cross = cross
+		best_crossed = crossed
+		best_err = err
+		if iteration == 0:
+			if crossed:
+				aim_point += Vector3(target.x - cross.x, target.y - cross.y, 0.0)
+			else:
+				# Ball landed short of the plane (in the dirt): raise the
+				# aim and let the refinement iteration try again.
+				aim_point += Vector3(0.0, 1.0, 0.0)
+	out["dir"] = best_dir
+	out["cross_pos"] = best_cross
+	out["crossed"] = best_crossed
+	out["error_m"] = best_err
+	return out
 
 
 static func roll01_from_features(features: PackedFloat32Array) -> float:

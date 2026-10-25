@@ -29,16 +29,30 @@ that's the failure mode, not the test.
 ## What to do in the headset
 
 1. Pick throwing hand + posture (sitting or standing) on the panel.
-2. **Begin enrollment.** Follow the prompts, one throw at a time:
+2. **Begin enrollment.** Follow the prompts:
+   - **Gaze calibration (eleventh pass, first step):** five targets light
+     one at a time on the strike-zone frame — center, then the corners.
+     Look at the lit target and hold your gaze; it captures by itself
+     when your head is still (no buttons). From the five looks the game
+     fits the fixed rotation between the headset's forward and *your*
+     eye line, and every later pitch aims with the corrected line.
+     **Re-gaze** (in the re-enroll row) re-runs just this step.
    - 3 hardest *comfortable* fastballs (calibration — your 100% becomes 96 mph),
    - 3 fastball motions,
    - 3 FAST fastballs and 3 MEDIUM fastballs (your velocity gears — each
      anchor is the **median** of its 3 throws, so one wild throw can't
      drag it the way an average can).
    A throw = hold **grip** to hold the ball, make your motion, **release grip**
-   at your release point. The ball flies where your *arm* was throwing —
-   direction is read from the peak-speed window of the delivery, not from
-   the frame where the grip happened to let go.
+   at your release point. **Aim is your eye line, not your hand**
+   (eleventh pass — two sessions of throw-log data retired hand-velocity
+   aim: it scattered 12–18° across throws while the head line scattered
+   2.8°). The pitch targets where your corrected gaze crosses the plate;
+   a share of your hand's miss leaks in, scaled by the **Scatter slider**
+   (0.00–0.60, default 0.25, next to Boost) — a clean delivery flies true
+   to your look, a sloppy one leaks. The launch is drop-compensated
+   against the flight sim, so the ball crosses where it was aimed. If a
+   throw somehow carries no head data, it falls back to the old
+   peak-speed-window arm direction, unchanged.
    - **Fastball only, for now (ninth pass):** enrollment is the fastball
      and its gears, and free throw treats every throw as a fastball — the
      classifier isn't consulted until a curveball exists. The curveball
@@ -75,10 +89,14 @@ Enrollment persists (`user://duel_profile.json`) — re-tests skip setup.
 - **Throwing hand GRIP**: squeeze to start the throw; release at your
   release point to throw. A ball is in your hand from spawn — the squeeze
   starts the measured throw, it doesn't summon the ball.
-- **Your arm**: the throw itself. Nothing else affects the pitch.
+- **Your arm**: the throw itself — it sets the velocity (and, scaled by
+  the Scatter slider, the leak). **Your eyes**: the aim — look at your
+  spot through the delivery.
 - **Other hand**: point the beam at the panel (red = aiming, green = on the
   panel, dot = hit point); **TRIGGER** clicks buttons and drags the Boost
-  slider. The beam flashes on a click.
+  and Scatter sliders. The beam flashes on a click.
+- **Your gaze (enrollment)**: look at each lit target and hold still —
+  gaze calibration captures by dwell, no buttons.
 - **Quest system button (long-press)**: recenter (OS-level, not bound by the game).
 - Nothing else is bound. There is no keyboard/mouse control in the headset.
 
@@ -129,21 +147,21 @@ sound beyond two tiny UI blips (no loops — nothing can play after close).
   calibration, gears and PBs intact, but their pitch templates are
   dropped with a panel explanation — v1 measured 12 features, the
   classifier now reads 15, and old templates would silently misread.
-- Aim is still read from the hand (release intent, seventh pass). The
-  session-1 throw data says that signal scatters ~12° from a full
-  windup — the velocity direction sweeps 8–24° per 90 Hz frame near
-  release — so the throw recorder (v2, tenth pass) now also logs the
-  **head line** on every sample (`hp`/`hq`) plus per-throw head
-  summaries (forward at release, over the delivery window, at peak
-  hand speed, and window stability). Whether the eye line is the
-  tighter signal gets judged on that data before any aim rebuild;
-  nothing in-game reads the head fields yet.
+- Aim was read from the hand through the tenth pass; the session data
+  retired it (hand intent scattered 12.3° in session 1 and 18.0° in
+  session 2, while the head line scattered 2.8° with 0.2° in-delivery
+  stability). The eleventh pass rebuilt aim on the head line (see
+  "What to do in the headset"); the throw recorder is now v3 and logs
+  the aim decomposition per throw (raw head cross, corrected target,
+  final aim cross, scatter k, gaze flag) beside the achieved cross.
+  Hand aim survives only as the fallback for a throw with no head
+  data — and as the leak the Scatter slider meters.
 
 ## Verification (what the machine checked vs what it can't)
 
 Headless, with the real Godot 4.7 binary:
 
-- `tests/run_tests.gd` — 52 checks on the pure logic: classifier separates
+- `tests/run_tests.gd` — 64 checks on the pure logic: classifier separates
   synthetic FB/CB and rejects a mushy pair, velocity mapping/gears, warp
   bounds and delivery compression, flight times, curveball crosses 0.82 m
   below a same-speed fastball, profile round-trip. The seventh-pass
@@ -158,8 +176,15 @@ Headless, with the real Godot 4.7 binary:
   checks cover the head-line summary (a still head reads release =
   window = peak forwards at 0.0° stability; a turning head reads real
   instability; headless samples report no head data) and the median
-  (the split gear pair 9.96/4.95/7.45 medians to exactly 7.45). All pass.
-- `tests/smoke_main.gd` — 78 checks driving the real main scene: full
+  (the split gear pair 9.96/4.95/7.45 medians to exactly 7.45). The
+  eleventh-pass logic checks cover the aim model: plate-cross geometry;
+  scatter (k=0 → aim cross is the target exactly; k=0.25 → a quarter of
+  the way from T to I); the gaze fit (a head worn with a constant
+  +5°/+4° bias through the five targets fits to ~0.0° residual, and a
+  corrected center look lands within 0.15 m of zone center); and the
+  drop-compensated launch solve (the simulated ball crosses within
+  0.10 m of the aim point at 96 mph and at 65 mph). All pass.
+- `tests/smoke_main.gd` — 93 checks driving the real main scene: full
   enrollment flow, free throw classified and announced ("FASTBALL at 95 mph"),
   watch-mode curveball announced, profile save/reload/wipe — plus the
   cue flow (picker + ghost show only on the CB step, the chosen picture
@@ -176,7 +201,14 @@ Headless, with the real Godot 4.7 binary:
   record and the panel note, stores the pending max, and the pending
   max merges at the next enrollment start), and the gear median (the
   step refuses to complete at 2 throws; 9.96/4.95/7.45 anchors at
-  exactly 7.45). All pass.
+  exactly 7.45). The eleventh-pass smoke checks cover the gaze step
+  (a wandering head never captures; a still head captures all five
+  targets by dwell, fits the correction, and hands off to calibration
+  in the default flow), recorder v3 (a head-carrying throw records
+  target/aim/raw crosses with the live scatter k; a no-head throw
+  records null aim fields), and the v2→v3 profile upgrade (templates
+  SURVIVE — no vector changed — gaze loads uncalibrated with a Re-gaze
+  suggestion; scatter round-trips). All pass.
 - `tests/render_spawn_view.gd` — 44 checks: renders an actual frame of
   the spawn view (Xvfb + GL) with the rig posed as a player stands, and
   saves it to `tests/spawn_view.png`: panel in front with legible UI
